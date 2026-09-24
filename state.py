@@ -1,0 +1,411 @@
+"""context_archiver 状态层。
+
+分三块：
+
+- **每流状态**：活跃时间、结束信号、待归档水位线、滚动摘要——落盘在
+  ``data/json_storage/context_archiver/``，命名空间 ``context_archiver``；
+- **审计记录**：每次归档写一条（时间区间、消息条数、摘要、memory_id、是否清空），
+  回答「那天到底归档了什么」；清空不可逆，这份记录是唯一的事后依据；
+- **进程内缓存**：``service_api.get_service()`` 每次调用都新建实例，
+  所以缓存与落盘节流必须挂在**类属性**上，放实例上等于没有。
+
+读写一律「失败降级」：IO 出错返回默认值并记日志，绝不打断对话主流程。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from src.app.plugin_system.api import storage_api
+from src.app.plugin_system.api.log_api import get_logger
+
+logger = get_logger("context_archiver.state")
+
+#: JSON 存储命名空间。
+STORE_NAME = "context_archiver"
+
+#: 每流状态的存储键。
+STREAMS_KEY = "streams"
+
+#: 审计记录的存储键。
+AUDIT_KEY = "audit"
+
+#: 本地记忆兜底（sink=local）的存储键。
+LOCAL_MEMORY_KEY = "local_memories"
+
+#: 结束信号里被视为「话题结束」的 action 名。
+END_ACTION_NAMES: frozenset[str] = frozenset({"stop_conversation"})
+
+#: 结束信号里**不算**结束的 action 名（挂起等恢复，绝不能当结束）。
+WAIT_ACTION_NAMES: frozenset[str] = frozenset({"pass_and_wait"})
+
+
+# --------------------------------------------------------------------------- #
+# 数据结构
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class StreamState:
+    """单个聊天流的归档状态。
+
+    Attributes:
+        stream_id: 聊天流标识。
+        last_activity_at: 最近一次活跃时刻（收到/发出消息、或动作触发）。
+        last_activity_kind: 最近一次活跃的来源，排查用。
+        end_signal_at: 最近一次收到结束信号（stop_conversation）的时刻。
+        end_signal_name: 结束信号的动作名。
+        pending_count: 自上次归档以来累计的消息条数。
+        waterline_ts: 已归档到的水位线（消息时间戳）；归档只处理比它新的消息。
+        last_archive_at: 最近一次归档时刻。
+        archive_count: 本流累计归档次数。
+        summary: 滚动摘要——清空上下文后，靠它让 Bot 还记得这段聊过什么。
+        summary_updated_at: 摘要最近更新时间。
+        last_observer_log_at: observer 模式最近一次打日志的时间（防刷屏）。
+        last_settled_signal_at: 已经归档过的那个结束信号时刻，避免重复触发。
+    """
+
+    stream_id: str = ""
+    last_activity_at: float = 0.0
+    last_activity_kind: str = ""
+    end_signal_at: float = 0.0
+    end_signal_name: str = ""
+    pending_count: int = 0
+    waterline_ts: float = 0.0
+    last_archive_at: float = 0.0
+    archive_count: int = 0
+    summary: str = ""
+    summary_updated_at: float = 0.0
+    last_observer_log_at: float = 0.0
+    last_settled_signal_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可落盘的字典。"""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> StreamState:
+        """从落盘字典恢复，字段缺失或类型异常时退回默认值。"""
+        if not isinstance(data, dict):
+            return cls()
+
+        def _num(key: str) -> float:
+            try:
+                return float(data.get(key) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _int(key: str) -> int:
+            try:
+                return int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return cls(
+            stream_id=str(data.get("stream_id") or ""),
+            last_activity_at=_num("last_activity_at"),
+            last_activity_kind=str(data.get("last_activity_kind") or ""),
+            end_signal_at=_num("end_signal_at"),
+            end_signal_name=str(data.get("end_signal_name") or ""),
+            pending_count=_int("pending_count"),
+            waterline_ts=_num("waterline_ts"),
+            last_archive_at=_num("last_archive_at"),
+            archive_count=_int("archive_count"),
+            summary=str(data.get("summary") or ""),
+            summary_updated_at=_num("summary_updated_at"),
+            last_observer_log_at=_num("last_observer_log_at"),
+            last_settled_signal_at=_num("last_settled_signal_at"),
+        )
+
+
+@dataclass
+class ArchiveAuditRecord:
+    """一次归档尝试的审计记录（成功与失败都记）。
+
+    Attributes:
+        at: 记录时刻。
+        stream_id: 聊天流标识。
+        trigger: 触发原因（结束信号 / 闲置 / 手动）。
+        message_count: 参与总结的消息条数。
+        start_ts: 消息区间起点（epoch 秒）。
+        end_ts: 消息区间终点（epoch 秒）。
+        summary: 生成的摘要（截断后存，完整摘要另见 streams 状态）。
+        memory_ids: 写入记忆后拿到的 id 列表。
+        sink: 实际使用的 sink 名。
+        cleared: 是否执行了清空。
+        ok: 整体是否成功。
+        error: 失败原因摘要。
+    """
+
+    at: float = 0.0
+    stream_id: str = ""
+    trigger: str = ""
+    message_count: int = 0
+    start_ts: float = 0.0
+    end_ts: float = 0.0
+    summary: str = ""
+    memory_ids: list[str] = field(default_factory=list)
+    sink: str = ""
+    cleared: bool = False
+    ok: bool = False
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可落盘的字典。"""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ArchiveAuditRecord:
+        """从落盘字典恢复。"""
+        if not isinstance(data, dict):
+            return cls()
+
+        def _num(key: str) -> float:
+            try:
+                return float(data.get(key) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _int(key: str) -> int:
+            try:
+                return int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        ids = data.get("memory_ids")
+        return cls(
+            at=_num("at"),
+            stream_id=str(data.get("stream_id") or ""),
+            trigger=str(data.get("trigger") or ""),
+            message_count=_int("message_count"),
+            start_ts=_num("start_ts"),
+            end_ts=_num("end_ts"),
+            summary=str(data.get("summary") or ""),
+            memory_ids=[str(x) for x in ids] if isinstance(ids, list) else [],
+            sink=str(data.get("sink") or ""),
+            cleared=bool(data.get("cleared", False)),
+            ok=bool(data.get("ok", False)),
+            error=str(data.get("error") or ""),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 存储：每流状态
+# --------------------------------------------------------------------------- #
+
+
+class ArchiveStateStore:
+    """每流状态的进程内缓存 + 落盘。
+
+    缓存与节流都是**类属性**：框架每次 ``get_service()`` 都会新建服务实例，
+    实例属性带不走。
+    """
+
+    #: 进程内缓存：stream_id -> StreamState。
+    _cache: dict[str, StreamState] | None = None
+
+    #: 最近一次落盘的单调时钟读数，用于节流。
+    _last_save_mono: float = -1.0e9
+
+    #: 落盘最小间隔（秒）。
+    _SAVE_THROTTLE: float = 3.0
+
+    @classmethod
+    async def load_all(cls, *, fresh: bool = False) -> dict[str, StreamState]:
+        """读取全部流状态。
+
+        Args:
+            fresh: 是否强制从盘上重读（手动触发归档前用）。
+
+        Returns:
+            ``stream_id -> StreamState`` 的字典。
+        """
+        if not fresh and cls._cache is not None:
+            return cls._cache
+
+        try:
+            raw = await storage_api.load_json(STORE_NAME, STREAMS_KEY)
+        except Exception as error:  # noqa: BLE001 - 存储异常不应影响对话主流程
+            logger.warning(f"[context_archiver] 读取流状态失败，按空状态处理: {error}")
+            raw = None
+
+        states: dict[str, StreamState] = {}
+        if isinstance(raw, dict):
+            for stream_id, payload in raw.items():
+                state = StreamState.from_dict(payload if isinstance(payload, dict) else None)
+                if not state.stream_id:
+                    state.stream_id = str(stream_id)
+                states[str(stream_id)] = state
+
+        cls._cache = states
+        return states
+
+    @classmethod
+    async def save_all(
+        cls,
+        states: dict[str, StreamState],
+        *,
+        force: bool = False,
+    ) -> bool:
+        """写入全部流状态。
+
+        Args:
+            states: 状态字典。
+            force: 是否忽略落盘节流。
+
+        Returns:
+            是否真的写入成功。
+        """
+        current_mono = time.monotonic()
+        if not force and (current_mono - cls._last_save_mono) < cls._SAVE_THROTTLE:
+            return False
+
+        payload = {sid: state.to_dict() for sid, state in states.items()}
+        try:
+            await storage_api.save_json(STORE_NAME, STREAMS_KEY, payload)
+        except Exception as error:  # noqa: BLE001 - 存储异常不应影响对话主流程
+            logger.warning(f"[context_archiver] 写入流状态失败: {error}")
+            return False
+
+        cls._cache = states
+        cls._last_save_mono = current_mono
+        return True
+
+    @classmethod
+    async def get(cls, stream_id: str, *, fresh: bool = False) -> StreamState:
+        """取某个流的状态，不存在时新建（不落盘）。
+
+        Args:
+            stream_id: 聊天流标识。
+            fresh: 是否强制从盘上重读。
+
+        Returns:
+            状态实例（永不为 ``None``）。
+        """
+        states = await cls.load_all(fresh=fresh)
+        normalized = str(stream_id or "")
+        state = states.get(normalized)
+        if state is None:
+            state = StreamState(stream_id=normalized)
+            states[normalized] = state
+        return state
+
+    @classmethod
+    def invalidate(cls) -> None:
+        """丢弃进程内缓存（下次读取重新从盘上加载）。"""
+        cls._cache = None
+        cls._last_save_mono = -1.0e9
+
+
+# --------------------------------------------------------------------------- #
+# 存储：审计
+# --------------------------------------------------------------------------- #
+
+
+async def load_audit() -> list[ArchiveAuditRecord]:
+    """读取审计记录（最近的在前）。
+
+    Returns:
+        审计记录列表；读取失败时返回空列表。
+    """
+    try:
+        raw = await storage_api.load_json(STORE_NAME, AUDIT_KEY)
+    except Exception as error:  # noqa: BLE001 - 审计读不到不该影响归档
+        logger.warning(f"[context_archiver] 读取审计记录失败: {error}")
+        return []
+    if not isinstance(raw, list):
+        return []
+    records: list[ArchiveAuditRecord] = []
+    for item in raw:
+        records.append(ArchiveAuditRecord.from_dict(item if isinstance(item, dict) else None))
+    return records
+
+
+async def append_audit(record: ArchiveAuditRecord, *, keep: int) -> bool:
+    """追加一条审计记录并裁剪到保留上限。
+
+    Args:
+        record: 审计记录。
+        keep: 最多保留多少条。
+
+    Returns:
+        是否写入成功。
+    """
+    records = await load_audit()
+    records.insert(0, record)
+    limit = max(1, int(keep))
+    if len(records) > limit:
+        records = records[:limit]
+    try:
+        await storage_api.save_json(
+            STORE_NAME,
+            AUDIT_KEY,
+            [item.to_dict() for item in records],
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - 审计写不进去不阻断归档本身
+        logger.warning(f"[context_archiver] 写入审计记录失败: {error}")
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# 存储：本地记忆兜底
+# --------------------------------------------------------------------------- #
+
+
+async def append_local_memories(entries: list[dict[str, Any]], *, keep: int = 2000) -> bool:
+    """把记忆条目追加到本地 json（``sink=local`` 或 booku 不可用时兜底）。
+
+    Args:
+        entries: 记忆条目字典列表。
+        keep: 最多保留多少条。
+
+    Returns:
+        是否写入成功。
+    """
+    if not entries:
+        return True
+    try:
+        raw = await storage_api.load_json(STORE_NAME, LOCAL_MEMORY_KEY)
+    except Exception:  # noqa: BLE001 - 读不到按空处理
+        raw = None
+    existing: list[Any] = list(raw) if isinstance(raw, list) else []
+    existing.extend(entries)
+    if len(existing) > keep:
+        existing = existing[-keep:]
+    try:
+        await storage_api.save_json(STORE_NAME, LOCAL_MEMORY_KEY, existing)
+        return True
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"[context_archiver] 写入本地记忆失败: {error}")
+        return False
+
+
+async def load_local_memories() -> list[dict[str, Any]]:
+    """读取本地兜底记忆。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, LOCAL_MEMORY_KEY)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+__all__ = [
+    "AUDIT_KEY",
+    "END_ACTION_NAMES",
+    "LOCAL_MEMORY_KEY",
+    "STORE_NAME",
+    "STREAMS_KEY",
+    "WAIT_ACTION_NAMES",
+    "ArchiveAuditRecord",
+    "ArchiveStateStore",
+    "StreamState",
+    "append_audit",
+    "append_local_memories",
+    "load_audit",
+    "load_local_memories",
+]

@@ -1,0 +1,51 @@
+{
+  "name": "context_archiver",
+  "display_name": "上下文归档器",
+  "version": "1.0.0",
+  "description": "话题结束时把这段对话总结进记忆，然后清空该聊天流的上下文，让 Bot 不用每轮背着整段历史说话。优先识别 stop_conversation 结束信号，配合 time_sense 判断全局静默；没有 time_sense 时用闲置时长兜底。默认 observer 模式（只观测不动作），清空需显式开启。",
+  "author": "Aemeath",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "service",
+      "component_name": "context_archiver",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "activity_tracker",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "archive_summary_injector",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "command",
+      "component_name": "archive",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "api_version": {
+    "command_api": "1.0.0",
+    "config_api": "1.0.0",
+    "llm_api": "1.0.0",
+    "log_api": "1.0.0",
+    "permission_api": "1.0.0",
+    "send_api": "1.0.0",
+    "service_api": "1.0.0",
+    "storage_api": "1.0.0",
+    "stream_api": "1.0.0"
+  },
+  "python_dependencies": [],
+  "dependencies_required": false
+}
