@@ -119,24 +119,26 @@ class ContextArchiverConfig(BaseConfig):
             ),
         )
         turn_trigger_enabled: bool = Field(
-            default=False,
+            default=True,
             description=(
-                "按轮数触发（**可选，默认关闭**）：该流累积够 turn_threshold 条消息就归档一次，"
-                "不等话题结束。\n"
-                "默认关闭是有意的——**写记忆的默认时机是「这个流安静下来了」**"
-                "（流里没人再发消息），那才是「这段对话结束了」的自然语义。\n"
-                "要「记得更勤」，应该调小 trigger.idle_seconds，而不是打开这个："
-                "聊着就定期沉淀会把同一段对话切成好几份，记忆反而更碎。"
+                "按消息条数触发：该流累积够 turn_threshold 条消息就归档一次，"
+                "不等静默、不管话题有没有结束。\n"
+                "它与 trigger.idle_seconds 是**「或」**的关系，满足任意一个就归档：\n"
+                "  · 攒够 turn_threshold 条（默认 100）→ 归档\n"
+                "  · Bot 停口 idle_seconds 秒（默认 30）+ 消息数够 min_messages → 归档\n"
+                "为什么要「或」：极活跃的群里 30 秒静默可能永远不出现，"
+                "而话痨的 Bot 也让「参与静默」很难成立——条数这条兜住它们。\n"
+                "轮数触发**只写记忆、绝不清空上下文**（话题可能还在继续）。"
             ),
         )
         turn_threshold: int = Field(
-            default=12,
+            default=100,
             description=(
-                "累积多少条消息触发一次轮数归档。\n"
-                "调小＝记得更勤、花的模型调用更多；调大＝省调用但记得粗。"
+                "累积多少条消息触发一次条数归档。\n"
+                "调小＝写得更勤、花的模型调用更多；调大＝省调用但记忆更粗。"
             ),
             ge=2,
-            le=500,
+            le=5000,
         )
 
     @config_section("archive")
