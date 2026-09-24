@@ -68,6 +68,7 @@ class FakeMessage:
     time: float
     person_id: str = "person-a"
     content: str = "内容"
+    message_id: str = ""
 
 
 class FakeStreamApi:
@@ -89,8 +90,10 @@ class FakeStreamApi:
 
 
 def _desc_page(start_ts: float, count: int) -> list[FakeMessage]:
-    """造一页「最新在前」的消息：时间从 start_ts 递减。"""
-    return [FakeMessage(time=start_ts - i) for i in range(count)]
+    """造一页消息：时间从 start_ts 递减，并带上可用的 message_id。"""
+    return [
+        FakeMessage(time=start_ts - i, message_id=f"id-{i}") for i in range(count)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -104,32 +107,53 @@ def test_collect_messages() -> None:
     real_api = archiver.stream_api
 
     try:
-        # A. 水位线：遇到旧消息即停，并过滤掉它
+        # A. 时间戳只当安全下界：比它旧的排除，取不到时间的宁可保留
         fake = FakeStreamApi([_desc_page(300.0, 3)])  # 300, 299, 298
         archiver.stream_api = fake
         messages, truncated = asyncio.run(
             archiver.collect_messages("s", waterline_ts=299.0, max_messages=400)
         )
-        check("水位线过滤生效（只取 > 299 的 1 条）", len(messages) == 1, f"实际 {len(messages)}")
-        check("水位线过滤不算截断", truncated is False)
+        check("时间下界过滤生效（只取 > 299 的 1 条）", len(messages) == 1, f"实际 {len(messages)}")
+        check("没取满不算截断", truncated is False)
         check("返回按时间升序", [m.time for m in messages] == sorted(m.time for m in messages))
 
-        # B. 翻页：第一页全是新消息时应继续翻，直到遇到旧消息
-        page0 = _desc_page(1000.0, 100)  # 1000..901
-        page1 = _desc_page(900.0, 100)  # 900..801，其中 900 及以下都不比水位线新
-        fake = FakeStreamApi([page0, page1])
+        # A2. 时间取不到（0）时不能被下界误排除
+        fake = FakeStreamApi([[FakeMessage(time=0.0, message_id="z1")]])
+        archiver.stream_api = fake
+        messages, _ = asyncio.run(
+            archiver.collect_messages("s", waterline_ts=299.0, max_messages=400)
+        )
+        check("时间戳无效的消息不被误排除", len(messages) == 1, f"实际 {len(messages)}")
+
+        # B. 只取一页（最新 cap 条），按 message_id 过滤已归档的
+        page0 = _desc_page(1000.0, 100)  # 1000..901，带 id-0..id-99
+        fake = FakeStreamApi([page0])
         archiver.stream_api = fake
         messages, truncated = asyncio.run(
-            archiver.collect_messages("s", waterline_ts=900.0, max_messages=400)
+            archiver.collect_messages("s", waterline_ts=0.0, max_messages=400)
         )
-        check("翻页取全（100 条新消息全部取回）", len(messages) == 100, f"实际 {len(messages)}")
+        check("一页取全（100 条）", len(messages) == 100, f"实际 {len(messages)}")
+        check("只请求一次（不再翻页找边界）", len(fake.calls) == 1, f"请求 {fake.calls}")
+        check("没取满不算截断", truncated is False)
+
+        # B2. 已归档的 id 是**交错**分布的，也要能正确过滤（这是老实现最致命的错）
+        blocked = {f"id-{i}" for i in range(0, 100, 2)}  # 偶数号已归档
+        fake = FakeStreamApi([_desc_page(1000.0, 100)])
+        archiver.stream_api = fake
+        messages, _ = asyncio.run(
+            archiver.collect_messages(
+                "s", waterline_ts=0.0, exclude_ids=blocked, max_messages=400
+            )
+        )
         check(
-            "取回的正是 1000..901 那一段",
-            [m.time for m in messages] == [float(t) for t in range(901, 1001)],
-            f"首尾 {messages[0].time}~{messages[-1].time}" if messages else "空",
+            "交错分布下已归档的被全部过滤（剩 50 条）",
+            len(messages) == 50,
+            f"实际 {len(messages)}",
         )
-        check("翻页命中旧消息后停止（没有多翻）", len(fake.calls) == 2, f"请求 {fake.calls}")
-        check("翻页取全不算截断", truncated is False)
+        check(
+            "过滤后剩下的 id 都不在已归档集合里",
+            all(m.message_id not in blocked for m in messages),
+        )
 
         # C. 超上限：必须报 truncated（调用方据此跳过清空）
         fake = FakeStreamApi([_desc_page(1000.0, 100)])
