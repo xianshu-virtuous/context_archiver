@@ -247,52 +247,44 @@ async def collect_messages(
         ``(消息列表按时间升序, 是否被截断)``。
     """
     cap = max(10, min(int(max_messages), 5000))
-    page_size = 100
-    #: 翻页硬上限，防止历史极长时把一次巡检拖死。
-    max_pages = 60
-
-    collected: list[Any] = []
     blocked = exclude_ids or set()
     floor = float(waterline_ts or 0.0)
-    truncated = False
 
     try:
-        for page in range(max_pages):
-            offset = page * page_size
-            raw = await stream_api.get_stream_messages(
-                stream_id, limit=page_size, offset=offset
-            )
-            if not raw:
-                break
-
-            hit_known = False
-            for message in raw:
-                memory_id = _message_id(message)
-                if memory_id and memory_id in blocked:
-                    # 倒序翻页时遇到已归档的消息，说明它后面的（更旧的）也处理过了
-                    hit_known = True
-                    break
-                if floor > 0 and float(_message_time(message)) <= floor:
-                    hit_known = True
-                    break
-                collected.append(message)
-
-            if hit_known or len(raw) < page_size:
-                break
-            if len(collected) >= cap:
-                truncated = True
-                break
+        # 只取一页「最新的 cap 条」，然后**过滤**掉已归档的 —— 不翻页找边界。
+        #
+        # 两个坑（都踩过）：
+        # 1. 框架的 get_stream_messages 查询用 .order_by("-id") 但返回前 reversed()，
+        #    所以**返回是升序**（最旧在前），不是最新在前。按"最新在前"写翻页逻辑，
+        #    第一个元素就是最旧的，一遇到已归档的 id 就停 → 永远返回空。
+        # 2. 已归档的 id 与未归档的新消息是**交错**的，不是连续的块，
+        #    "遇到就停"这种边界判断根本不成立。
+        raw = await stream_api.get_stream_messages(stream_id, limit=cap, offset=0)
     except Exception as error:  # noqa: BLE001 - 读不到消息就当没有可归档内容
         logger.warning(f"[context_archiver] 读取流消息失败（{stream_id[:8]}）: {error}")
         return [], False
 
+    if not raw:
+        return [], False
+
+    collected: list[Any] = []
+    for message in raw:
+        message_id = _message_id(message)
+        if message_id and message_id in blocked:
+            continue
+        stamp = float(_message_time(message))
+        # 时间戳只当「安全下界」，而且只在它明显有效时才用——
+        # 取不到时间（0）的消息宁可多看一眼，也不要被误排除。
+        if floor > 0 and stamp > 0 and stamp <= floor:
+            continue
+        collected.append(message)
+
     collected.sort(key=_message_time)
     if len(collected) > cap:
-        # 取**最早**的 cap 条，不是最新的！
-        # 取最新会让更早的未归档消息在水位线推进后被永久跳过（没总结、也没记忆）。
         collected = collected[:cap]
-        truncated = True
-    return collected, truncated
+
+    # 取满一页说明可能还有更早的没取到：上位据此走保守分支（不清空）。
+    return collected, len(raw) >= cap
 
 
 def build_digest(messages: list[Any], *, max_chars: int) -> str:

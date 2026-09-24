@@ -193,14 +193,15 @@ class ContextArchiverConfig(BaseConfig):
             le=2.0,
         )
         max_tokens: int = Field(
-            default=2500,
+            default=8192,
             description=(
                 "输出上限（摘要 + 记忆条目一起）。\n"
-                "**别调太小**：实测 1200 会把 JSON 截断成非法格式，解析失败后整段内容被跳过，"
-                "等于白总结一次还把那段对话跳过去了。默认 2500。"
+                "**思考链模型必须给足**：实测某个模型光是思考链就吃掉 3000~6200 token，"
+                "上限太小会让正文（JSON）根本没机会输出——那不是「总结得短」，是「什么都没总结」。\n"
+                "默认 8192。用非思考模型可以调回 2000 左右。"
             ),
             ge=400,
-            le=8000,
+            le=32768,
         )
 
     @config_section("memory")
