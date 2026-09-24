@@ -54,12 +54,13 @@ class ContextArchiverConfig(BaseConfig):
         """「什么时候算话题结束」的判定配置。"""
 
         tick_seconds: int = Field(
-            default=60,
+            default=15,
             description=(
                 "判定巡检间隔（秒）。\n"
-                "与 time_sense 的 heartbeat_seconds 对齐时联动最自然（默认都是 300 的整数分频）。"
+                "必须明显小于 idle_seconds，否则「静默 30 秒」要等下一次巡检才被发现，"
+                "实际会变成「静默 30~45 秒」。默认 15。"
             ),
-            ge=10,
+            ge=5,
             le=3600,
         )
         settle_seconds: int = Field(
@@ -72,16 +73,16 @@ class ContextArchiverConfig(BaseConfig):
             le=3600,
         )
         idle_seconds: int = Field(
-            default=600,
+            default=30,
             description=(
-                "**Bot 多久没参与，就算这段对话跟它无关了**（秒）。\n"
-                "这是写记忆的主阈值：**Bot 自己发言**之后静默达到它，就总结、写记忆。\n"
-                "注意基准是「Bot 有没有参与」，不是「流有没有消息」——\n"
-                "群聊里别人一直说话时，流是活跃的，但 Bot 可能在潜水；\n"
-                "潜水期间旁观到的内容照样要沉淀成记忆，否则它们只会一直堆在上下文里。\n"
-                "默认 600（10 分钟）：想记得更勤就调小。"
+                "**Bot 停口多久就算这一轮过去了**（秒）。\n"
+                "这是写记忆的主阈值：**Bot 上次发言**之后静默达到它，就总结、写记忆。\n"
+                "基准是「Bot 有没有参与」，不是「流有没有消息」——群聊里别人一直说话、"
+                "话痨的 Bot 也一直在接话，按「流安静」判就永远不会触发。\n"
+                "默认 30 秒：短到能插进话痨 Bot 的发言间隙，又长到不至于把半句话切断。\n"
+                "配合 trigger.tick_seconds（默认 15）一起用。"
             ),
-            ge=60,
+            ge=5,
             le=86400,
         )
         min_messages: int = Field(
