@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+r"""逻辑自检：不依赖框架运行时，把「最容易悄悄出错」的几处逐个钉住。
+
+重点覆盖三块：
+
+1. **分页与截断**（``collect_messages``）——``get_stream_messages`` 是按 ``-id``
+   倒序返回的，只取一页会漏掉更早的未归档消息，而这些消息会在水位线推进后
+   被永久跳过。这里用假的消息源复现三种情况：水位线截断、正常翻页、超上限截断。
+2. **模型脏输出解析**（``extract_json``）——模型爱把 JSON 包在代码围栏里、
+   用全角引号、写行注释、留尾逗号。
+3. **标签兜底**（``MemoryItem.normalized``）——booku_memory 要求
+   core/diffusion/opposing 三个标签都非空，缺一个就抛错。
+
+用法（实例 venv）：
+
+    $env:NEO_ROOT="F:\Neo-MoFox-Aemeath"
+    & "F:\Neo-MoFox-Aemeath\.venv\Scripts\python.exe" tests\check_logic.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+NEO_ROOT = Path(os.environ.get("NEO_ROOT", r"F:\Neo-MoFox-Aemeath"))
+sys.path.insert(0, str(NEO_ROOT))
+sys.path.insert(0, str(PLUGIN_DIR.parent))
+
+from context_archiver import archiver, llm, state as st  # noqa: E402
+from context_archiver.config import ContextArchiverConfig  # noqa: E402
+from context_archiver.sink import MemoryItem  # noqa: E402
+
+failures: list[str] = []
+checks = 0
+
+
+def check(label: str, condition: bool, detail: str = "") -> None:
+    """记录一条断言结果。"""
+    global checks
+    checks += 1
+    if condition:
+        print(f"  OK    {label}")
+    else:
+        print(f"  FAIL  {label}  {detail}")
+        failures.append(label)
+
+
+def section(title: str) -> None:
+    print()
+    print("=" * 68)
+    print(title)
+    print("=" * 68)
+
+
+# --------------------------------------------------------------------------- #
+# 假消息源（按 framework 的真实行为：-id 倒序 = 最新在前）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class FakeMessage:
+    """最小可用的消息替身。"""
+
+    time: float
+    person_id: str = "person-a"
+    content: str = "内容"
+
+
+class FakeStreamApi:
+    """假的 stream_api：按页返回「最新在前」的消息。"""
+
+    def __init__(self, pages: list[list[FakeMessage]]) -> None:
+        self._pages = pages
+        self.calls: list[tuple[int, int]] = []
+
+    async def get_stream_messages(
+        self, stream_id: str, limit: int = 100, offset: int = 0
+    ) -> list[FakeMessage]:
+        """按 offset 取第几页。"""
+        self.calls.append((limit, offset))
+        index = offset // max(1, limit)
+        if index >= len(self._pages):
+            return []
+        return list(self._pages[index])
+
+
+def _desc_page(start_ts: float, count: int) -> list[FakeMessage]:
+    """造一页「最新在前」的消息：时间从 start_ts 递减。"""
+    return [FakeMessage(time=start_ts - i) for i in range(count)]
+
+
+# --------------------------------------------------------------------------- #
+# 1. 分页与截断
+# --------------------------------------------------------------------------- #
+
+
+def test_collect_messages() -> None:
+    """collect_messages 的水位线、翻页与截断行为。"""
+    section("1. 消息读取：水位线 / 翻页 / 截断保护的")
+    real_api = archiver.stream_api
+
+    try:
+        # A. 水位线：遇到旧消息即停，并过滤掉它
+        fake = FakeStreamApi([_desc_page(300.0, 3)])  # 300, 299, 298
+        archiver.stream_api = fake
+        messages, truncated = asyncio.run(
+            archiver.collect_messages("s", waterline_ts=299.0, max_messages=400)
+        )
+        check("水位线过滤生效（只取 > 299 的 1 条）", len(messages) == 1, f"实际 {len(messages)}")
+        check("水位线过滤不算截断", truncated is False)
+        check("返回按时间升序", [m.time for m in messages] == sorted(m.time for m in messages))
+
+        # B. 翻页：第一页全是新消息时应继续翻，直到遇到旧消息
+        page0 = _desc_page(1000.0, 100)  # 1000..901
+        page1 = _desc_page(900.0, 100)  # 900..801，其中 900 及以下都不比水位线新
+        fake = FakeStreamApi([page0, page1])
+        archiver.stream_api = fake
+        messages, truncated = asyncio.run(
+            archiver.collect_messages("s", waterline_ts=900.0, max_messages=400)
+        )
+        check("翻页取全（100 条新消息全部取回）", len(messages) == 100, f"实际 {len(messages)}")
+        check(
+            "取回的正是 1000..901 那一段",
+            [m.time for m in messages] == [float(t) for t in range(901, 1001)],
+            f"首尾 {messages[0].time}~{messages[-1].time}" if messages else "空",
+        )
+        check("翻页命中旧消息后停止（没有多翻）", len(fake.calls) == 2, f"请求 {fake.calls}")
+        check("翻页取全不算截断", truncated is False)
+
+        # C. 超上限：必须报 truncated（调用方据此跳过清空）
+        fake = FakeStreamApi([_desc_page(1000.0, 100)])
+        archiver.stream_api = fake
+        messages, truncated = asyncio.run(
+            archiver.collect_messages("s", waterline_ts=0.0, max_messages=10)
+        )
+        check("超上限时截断标记为 True", truncated is True)
+        check("超上限时保留最新的那批（10 条）", len(messages) == 10, f"实际 {len(messages)}")
+        check(
+            "保留的是最新 10 条而非最旧",
+            [m.time for m in messages] == sorted(m.time for m in messages)
+            and min(m.time for m in messages) == 991.0,
+            f"最早一条 {min(m.time for m in messages)}",
+        )
+
+        # D. 读不到消息时返回空，且不抛异常
+        archiver.stream_api = FakeStreamApi([])
+        messages, truncated = asyncio.run(
+            archiver.collect_messages("s", waterline_ts=0.0, max_messages=400)
+        )
+        check("没有消息时返回空列表", messages == [] and truncated is False)
+    finally:
+        archiver.stream_api = real_api
+
+
+# --------------------------------------------------------------------------- #
+# 2. 模型脏输出解析
+# --------------------------------------------------------------------------- #
+
+
+def test_extract_json() -> None:
+    """extract_json 对各种模型输出的容错。"""
+    section("2. 模型输出解析（extract_json）")
+
+    cases: list[tuple[str, str, dict | None]] = [
+        ("干净的 JSON", '{"summary": "好", "memories": []}', {"summary": "好", "memories": []}),
+        ("代码围栏包裹", '```json\n{"summary": "围栏"}\n```', {"summary": "围栏"}),
+        ("围栏无语言标记", '```\n{"summary": "无标记"}\n```', {"summary": "无标记"}),
+        ("全角引号与冒号", '｛"summary"："全角"｝', None),  # 全角括号不在翻译表内，预期失败
+        ("前后有解释文字", '好的，这是结果：\n{"summary": "带前言"}\n以上。', {"summary": "带前言"}),
+        ("带行注释", '{\n  // 说明\n  "summary": "注释"\n}', {"summary": "注释"}),
+        ("带尾逗号", '{"summary": "尾逗号",}', {"summary": "尾逗号"}),
+        ("非 JSON 文本", "我觉得这段对话没什么特别的。", None),
+        ("空字符串", "", None),
+    ]
+
+    for label, text, expected in cases:
+        got = llm.extract_json(text)
+        if expected is None:
+            check(f"{label} → 不误报", got is None, f"实际 {got}")
+        else:
+            check(f"{label} → 解析正确", got == expected, f"实际 {got}")
+
+
+# --------------------------------------------------------------------------- #
+# 3. 标签兜底（booku 要求三元组非空）
+# --------------------------------------------------------------------------- #
+
+
+def test_memory_item_normalized() -> None:
+    """MemoryItem.normalized 的兜底行为。"""
+    section("3. 记忆条目标签兜底（booku 三元组必填）")
+
+    config = ContextArchiverConfig()
+
+    empty = MemoryItem(title="", content="内容", memory_type="乱写的类型")
+    normalized = empty.normalized(config)
+    check("空标题被兜底", bool(normalized.title), f"标题={normalized.title!r}")
+    check("core_tags 非空", bool(normalized.core_tags), f"{normalized.core_tags}")
+    check("diffusion_tags 非空", bool(normalized.diffusion_tags), f"{normalized.diffusion_tags}")
+    check("opposing_tags 非空", bool(normalized.opposing_tags), f"{normalized.opposing_tags}")
+    check("非法 memory_type 被纠正", normalized.memory_type in {
+        "event", "knowledge", "person", "place", "procedure"
+    }, f"{normalized.memory_type}")
+
+    given = MemoryItem(
+        title="有标签",
+        content="内容",
+        memory_type="person",
+        core_tags=["  ", ""],
+        diffusion_tags=["a", "b"],
+        opposing_tags=["c"],
+    )
+    normalized_given = given.normalized(config)
+    check("全是空白的标签被兜底替换", normalized_given.core_tags != ["  ", ""])
+    check("有内容的标签保持原样", normalized_given.diffusion_tags == ["a", "b"])
+    check("正常 memory_type 不被改动", normalized_given.memory_type == "person")
+
+    too_many = MemoryItem(
+        title="t",
+        content="c",
+        core_tags=[f"tag{i}" for i in range(20)],
+    ).normalized(config)
+    check("标签数量被裁剪", len(too_many.core_tags) <= 8, f"{len(too_many.core_tags)}")
+
+
+# --------------------------------------------------------------------------- #
+# 4. 对话文本装配
+# --------------------------------------------------------------------------- #
+
+
+def test_build_digest() -> None:
+    """build_digest 的截断与排序。"""
+    section("4. 对话文本装配（build_digest）")
+
+    empty = archiver.build_digest([], max_chars=1000)
+    check("空消息列表 → 空文本", empty == "")
+
+    messages = [FakeMessage(time=1_700_000_000 + i, content=f"第{i}句") for i in range(5)]
+    text = archiver.build_digest(messages, max_chars=10000)
+    check("包含全部句子", all(f"第{i}句" in text for i in range(5)))
+    check("每条都带时间戳", text.count("[") == 5, f"出现 {text.count('[')} 次")
+
+    long_messages = [FakeMessage(time=1_700_000_000 + i, content="长" * 200) for i in range(50)]
+    truncated_text = archiver.build_digest(long_messages, max_chars=1000)
+    check("超长时被截断到上限附近", len(truncated_text) <= 1400, f"实际 {len(truncated_text)}")
+    check("截断时保留的是最近的内容（有省略提示）", "省略" in truncated_text)
+
+
+# --------------------------------------------------------------------------- #
+# 5. 判定边界
+# --------------------------------------------------------------------------- #
+
+
+def test_evaluate_edges() -> None:
+    """evaluate 的边界。"""
+    section("5. 判定边界（evaluate）")
+
+    config = ContextArchiverConfig()
+    config.trigger.min_messages = 4
+    config.trigger.idle_seconds = 1800
+    config.trigger.settle_seconds = 90
+    now = 1_000_000.0
+
+    # settle_seconds = 0 时，结束信号立刻生效
+    config.trigger.settle_seconds = 0
+    decision = archiver.evaluate(
+        st.StreamState(
+            stream_id="x",
+            pending_count=10,
+            last_activity_at=now - 1,
+            end_signal_at=now - 1,
+            end_signal_name="stop_conversation",
+        ),
+        config,
+        now=now,
+    )
+    check("settle=0 时结束信号立即触发", decision.should is True and decision.trigger == "end_signal")
+
+    config.trigger.settle_seconds = 90
+    # 已处理过的结束信号不该重复触发（应退回闲置判定）
+    decision = archiver.evaluate(
+        st.StreamState(
+            stream_id="y",
+            pending_count=10,
+            last_activity_at=now - 5,
+            end_signal_at=now - 500,
+            last_settled_signal_at=now - 500,
+        ),
+        config,
+        now=now,
+    )
+    check("已消费的结束信号不重复触发", decision.should is False, f"{decision.reason}")
+
+    # 完全没有活跃记录
+    decision = archiver.evaluate(
+        st.StreamState(stream_id="z", pending_count=100), config, now=now
+    )
+    check("没有活跃记录 → 不归档", decision.should is False)
+
+    # 结束信号优先于「仍然活跃」
+    decision = archiver.evaluate(
+        st.StreamState(
+            stream_id="w",
+            pending_count=10,
+            last_activity_at=now - 1,
+            end_signal_at=now - 100,
+            end_signal_name="stop_conversation",
+        ),
+        config,
+        now=now,
+    )
+    check("刚说完话但有结束信号 → 仍归档", decision.should is True and decision.trigger == "end_signal")
+
+
+# --------------------------------------------------------------------------- #
+# 6. 审计记录序列化往返
+# --------------------------------------------------------------------------- #
+
+
+def test_audit_roundtrip() -> None:
+    """审计记录 to_dict/from_dict 往返不丢字段。"""
+    section("6. 审计记录序列化往返")
+
+    record = st.ArchiveAuditRecord(
+        at=1.0,
+        stream_id="s1",
+        trigger="end_signal",
+        message_count=12,
+        start_ts=10.0,
+        end_ts=20.0,
+        summary="摘要内容",
+        memory_ids=["m1", "m2"],
+        sink="booku",
+        cleared=True,
+        ok=True,
+        error="",
+    )
+    restored = st.ArchiveAuditRecord.from_dict(record.to_dict())
+    check("stream_id 保留", restored.stream_id == "s1")
+    check("memory_ids 保留", restored.memory_ids == ["m1", "m2"])
+    check("cleared 保留", restored.cleared is True)
+    check("message_count 保留", restored.message_count == 12)
+
+    broken = st.ArchiveAuditRecord.from_dict(None)
+    check("异常输入退回默认值", broken.stream_id == "" and broken.ok is False)
+
+    weird = st.ArchiveAuditRecord.from_dict(
+        {"memory_ids": "not-a-list", "message_count": "abc", "cleared": 1}
+    )
+    check("字段类型异常被容错", weird.memory_ids == [] and weird.message_count == 0)
+
+
+# --------------------------------------------------------------------------- #
+# 入口
+# --------------------------------------------------------------------------- #
+
+
+def main() -> int:
+    print(f"框架根  : {NEO_ROOT}")
+    print(f"插件目录: {PLUGIN_DIR}")
+    test_collect_messages()
+    test_extract_json()
+    test_memory_item_normalized()
+    test_build_digest()
+    test_evaluate_edges()
+    test_audit_roundtrip()
+
+    section("结果")
+    print(f"共 {checks} 项断言，失败 {len(failures)} 项")
+    for item in failures:
+        print(f"  - {item}")
+    print()
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
