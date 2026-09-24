@@ -86,7 +86,11 @@ class ActionStatsHandler(BaseEventHandler):
             return EventDecision.SUCCESS, params
 
         try:
-            if str(event_name) == str(EventType.AFTER_CHATTER_STEP):
+            # ⚠️ 必须直接比较枚举成员，**不能** str(event_name) == str(EventType.X)：
+            # EventType 是 str 枚举，在 Python 3.11 下 str(成员) 得到的是
+            # "EventType.AFTER_CHATTER_STEP" 而不是它的值 "after_chatter_step"，
+            # 于是永远不相等——handler 静默地什么都不做（这个坑害得统计一直为空）。
+            if event_name == EventType.AFTER_CHATTER_STEP:
                 await self._on_chatter_step(params)
             else:
                 await self._on_single_call(event_name, params)
