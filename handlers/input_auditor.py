@@ -113,13 +113,22 @@ class InputAuditorHandler(BaseEventHandler):
                 roles[role] = roles.get(role, 0) + chars
                 payload_chars += chars
 
+            # ⚠️ 工具声明会**同时**出现在 tools 参数和 payloads 的 ROLE.TOOL 里，
+            # 是同一批东西。直接相加会把工具声明算两遍（实测 66,866 被记成 133,732）。
+            # 所以：payloads 里已有 TOOL 角色时，就以 payloads 为准。
+            tool_in_payloads = any(
+                "TOOL" in str(role).upper() and "RESULT" not in str(role).upper()
+                for role in roles
+            )
+            total_chars = payload_chars if tool_in_payloads else payload_chars + tools_chars
+
             record = {
                 "at": time.time(),
                 "request_name": request_name,
                 "tools_count": len(tool_list),
                 "tools_chars": tools_chars,
                 "payload_chars": payload_chars,
-                "total_chars": tools_chars + payload_chars,
+                "total_chars": total_chars,
                 "roles": roles,
             }
             await state_module.record_input_audit(record)

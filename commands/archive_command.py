@@ -279,34 +279,46 @@ class ArchiveCommand(BaseCommand):
             return True, "empty"
 
         def tok(chars: float) -> int:
-            """字符数粗估 token（中文约 1 token ≈ 1.5 字符）。"""
+            """字符数粗估 token。
+
+            ⚠️ 两类内容的换算率差很多，不能一个系数走到底：
+            - 工具声明是 JSON / 英文标识符，约 **3.5 字符/token**；
+            - 中文对话约 **1.5 字符/token**。
+            """
             return int(chars / 1.5)
+
+        def tok_schema(chars: float) -> int:
+            """工具声明（JSON）的 token 估算。"""
+            return int(chars / 3.5)
 
         tools_chars = int(data.get("avg_tools_chars") or 0)
         payload_chars = int(data.get("avg_payload_chars") or 0)
-        total_chars = int(data.get("avg_total_chars") or 0) or (tools_chars + payload_chars)
+        total_chars = int(data.get("avg_total_chars") or 0) or payload_chars
         lines = [
-            f"【真实输入构成】{samples} 次请求采样",
-            f"  工具声明  {tools_chars:>8,} 字符 ≈ {tok(tools_chars):>7,} tok"
-            f"  （{data.get('avg_tools_count', 0)} 个）← 固定开销",
-            f"  payloads  {payload_chars:>8,} 字符 ≈ {tok(payload_chars):>7,} tok",
-            f"  合计      {total_chars:>8,} 字符 ≈ {tok(total_chars):>7,} tok",
+            f"【真实输入构成】{samples} 次请求采样（已去掉工具声明的重复计数）",
+            f"  工具声明  {tools_chars:>8,} 字符 ≈ {tok_schema(tools_chars):>7,} tok"
+            f"  （{data.get('avg_tools_count', 0)} 个）← 固定开销，JSON 按 3.5 字符/tok 算",
+            f"  payloads  {payload_chars:>8,} 字符（含工具声明那一份）",
+            f"  合计      {total_chars:>8,} 字符",
         ]
         roles = data.get("roles") or {}
         if roles:
             lines.append("")
-            lines.append("payloads 按角色：")
+            lines.append("payloads 按角色（TOOL 那行就是工具声明，同一份，别再相加）：")
             for role, chars in roles.items():
                 share = (chars / payload_chars * 100) if payload_chars else 0
+                upper = str(role).upper()
+                is_schema = "TOOL" in upper and "RESULT" not in upper
+                estimate = tok_schema(chars) if is_schema else tok(chars)
                 lines.append(
-                    f"  {str(role):<14}{int(chars):>8,} 字符 ≈ {tok(chars):>7,} tok"
+                    f"  {str(role):<14}{int(chars):>8,} 字符 ≈ {estimate:>7,} tok"
                     f"  （占 payloads {share:.0f}%）"
                 )
         lines.append("")
         lines.append("对照：实测单次请求约 59k token。工具声明占比越大，「按需暴露工具」越值。")
         if total_chars:
             lines.append(
-                f"当前：工具声明占单次输入 {tools_chars / total_chars * 100:.0f}%。"
+                f"当前：工具声明占单次输入 {tools_chars / total_chars * 100:.0f}%（字符口径）。"
             )
         await self._reply("\n".join(lines))
         return True, "input-audit"
