@@ -54,8 +54,11 @@ _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊�
 4. 不要复述原话，不要编造对话里没有的信息；不确定的就不要写。
 5. 标签三元组必须都给：core_tags（核心，1-3 个）、diffusion_tags（扩散，2-4 个）、opposing_tags（对立/反义，1-3 个）。
 6. memory_type 只能取：event（发生了什么）/ person（关于人的事实）/ knowledge（学到的知识）/ place（地点）/ procedure（做法、流程）。
-7. **务必控制在输出上限内**：摘要 300 字以内，记忆 **最多 5 条**、按重要性取前几条即可。
-   宁可少写几条，也不要让 JSON 被截断——被截断的输出等于什么都没总结。
+7. **写足细节，但别撑破 JSON**：摘要 400 字以内，记忆 **6~10 条**，每条不超过 150 字。
+   该留的细节：谁说了什么、答应了什么、数字与时间、原话里的关键措辞——
+   这些比"聊了聊近况"有用得多。信息密度要高，不要为了凑字数注水。
+8. 宁可少写一条，也不要让 JSON 被截断——被截断的输出等于什么都没总结。
+   （这一条比第 7 条更重要：写满但完整，胜过多写一条却被截断。）
 
 输出格式：
 {
@@ -646,6 +649,12 @@ async def archive_stream(
             item.event_start_at = start_ts
         if not item.event_end_at:
             item.event_end_at = end_ts
+        # 给每条记忆附「原文坐标」：以后想抠细节，照这个时间区间回查消息原文。
+        # 几乎不占 token（每条约 20 字符），却把「记得发生过」和「能查回细节」接上了——
+        # 这是在不加总结成本的前提下提高记忆深度的关键一步。
+        stamp = f"（{_clock(item.event_start_at)}）"
+        if item.content and stamp not in item.content:
+            item.content = item.content.rstrip() + stamp
 
     if dry_run:
         snapshot.ok = True
