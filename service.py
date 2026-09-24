@@ -240,6 +240,10 @@ class ContextArchiverService(BaseService):
             "recent": data.get("recent") if isinstance(data.get("recent"), list) else [],
         }
 
+    async def tool_names(self) -> list[str]:
+        """最近一次暴露给模型的全部工具名（「砍哪些」的决策输入）。"""
+        return await state_module.load_tool_names()
+
     async def archive_now(
         self,
         stream_id: str,

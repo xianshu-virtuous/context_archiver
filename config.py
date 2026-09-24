@@ -416,8 +416,13 @@ class ContextArchiverConfig(BaseConfig):
             ),
         )
         input_audit_request_names: list[str] = Field(
-            default_factory=lambda: ["default_chatter"],
-            description="只统计这些请求名（避免把总结、判定等旁路调用算进来）。",
+            default_factory=list,
+            description=(
+                "只统计这些请求名；**留空表示全部统计**（默认）。\n"
+                "留空更安全：实测请求名不一定就是 ``default_chatter``，"
+                "写死会把真正的调用整个漏掉（这个坑踩过一次）。\n"
+                "统计里会按 ``req:<请求名>`` 分组，所以混着也不会看不清。"
+            ),
         )
 
     @config_section("observer")

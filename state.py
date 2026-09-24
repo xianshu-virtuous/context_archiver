@@ -424,6 +424,12 @@ PROMPT_AUDIT_KEY = "prompt_audit"
 #: 真实输入构成统计的存储键（tools + payloads）。
 INPUT_AUDIT_KEY = "input_audit"
 
+#: 最近一次暴露的工具名清单。
+TOOL_NAMES_KEY = "tool_names"
+
+#: 每轮 payload 指纹（用来算「第一个变化出现在第几个 payload」= 缓存友好度）。
+FINGERPRINT_KEY = "fingerprints"
+
 #: 归因审计保留的最近样本条数。
 _PROMPT_AUDIT_KEEP = 40
 
@@ -792,20 +798,22 @@ async def _flush_input_audit(samples: list[dict[str, Any]]) -> bool:
     for item in samples:
         total += 1
         for key, value in item.items():
-            if key in ("at", "request_name", "roles"):
+            if key in ("at", "request_name", "roles", "req"):
                 continue
             try:
                 counters[key] = counters.get(key, 0) + int(value)
             except (TypeError, ValueError):
                 continue
-        roles = item.get("roles")
-        if isinstance(roles, dict):
-            for role, chars in roles.items():
-                try:
-                    mark = f"role:{role}"
-                    counters[mark] = counters.get(mark, 0) + int(chars)
-                except (TypeError, ValueError):
-                    continue
+        # 分组计数：roles → role:<角色>，req → req:<请求名>
+        for group_key, prefix in (("roles", "role:"), ("req", "req:")):
+            group = item.get(group_key)
+            if isinstance(group, dict):
+                for name, value in group.items():
+                    try:
+                        mark = f"{prefix}{name}"
+                        counters[mark] = counters.get(mark, 0) + int(value)
+                    except (TypeError, ValueError):
+                        continue
 
     recent = data.get("recent")
     merged: list[Any] = list(samples[-10:])
@@ -844,16 +852,108 @@ async def load_input_audit() -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+async def append_fingerprints(entry: dict[str, Any], *, keep: int = 40) -> bool:
+    """追加一轮 payload 指纹（保留最近 keep 轮）。
+
+    指纹 = 每个 payload 的「角色 / 字符数 / 内容哈希」序列。有了它就能算出
+    **第一个内容变化出现在第几个 payload** —— 那正是缓存失效的起点：
+    缓存按前缀匹配，从第一个不同处开始，后面全部作废。
+
+    Args:
+        entry: 单轮记录，含 at / fp（指纹数组）。
+        keep: 保留多少轮。
+
+    Returns:
+        是否写入成功。
+    """
+    try:
+        raw = await storage_api.load_json(STORE_NAME, FINGERPRINT_KEY)
+    except Exception:  # noqa: BLE001
+        raw = None
+    data = raw if isinstance(raw, dict) else {}
+    rounds = data.get("rounds")
+    merged: list[Any] = list(rounds) if isinstance(rounds, list) else []
+    merged.append(entry)
+    if len(merged) > max(1, int(keep)):
+        merged = merged[-max(1, int(keep)) :]
+
+    try:
+        await storage_api.save_json(
+            STORE_NAME,
+            FINGERPRINT_KEY,
+            {"rounds": merged, "updated_at": time.time()},
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - 记不下来不影响请求
+        logger.warning(f"[context_archiver] 写入 payload 指纹失败: {error}")
+        return False
+
+
+async def load_fingerprints() -> list[dict[str, Any]]:
+    """读取最近的 payload 指纹记录。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, FINGERPRINT_KEY)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(raw, dict):
+        return []
+    rounds = raw.get("rounds")
+    if not isinstance(rounds, list):
+        return []
+    return [item for item in rounds if isinstance(item, dict)]
+
+
+async def save_tool_names(names: list[str]) -> bool:
+    """记录当前暴露的工具名清单（覆盖式，只留最新一次）。
+
+    要决定「砍哪些工具」，先得知道暴露了哪些。这个清单是那份决策的输入。
+
+    Args:
+        names: 工具名列表（已去重）。
+
+    Returns:
+        是否写入成功。
+    """
+    if not names:
+        return False
+    try:
+        await storage_api.save_json(
+            STORE_NAME,
+            TOOL_NAMES_KEY,
+            {"names": list(names), "count": len(names), "updated_at": time.time()},
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - 记不下来不影响请求
+        logger.warning(f"[context_archiver] 写入工具清单失败: {error}")
+        return False
+
+
+async def load_tool_names() -> list[str]:
+    """读取最近一次暴露的工具名清单。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, TOOL_NAMES_KEY)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(raw, dict):
+        return []
+    names = raw.get("names")
+    if not isinstance(names, list):
+        return []
+    return [str(item) for item in names if str(item).strip()]
+
+
 __all__ = [
     "ACTION_STATS_KEY",
     "AUDIT_KEY",
     "END_ACTION_NAMES",
+    "FINGERPRINT_KEY",
     "INPUT_AUDIT_KEY",
     "LOCAL_MEMORY_KEY",
     "PROMPT_AUDIT_KEY",
     "RECALL_STATS_KEY",
     "STORE_NAME",
     "STREAMS_KEY",
+    "TOOL_NAMES_KEY",
     "WAIT_ACTION_NAMES",
     "ArchiveAuditRecord",
     "ArchiveStateStore",
@@ -861,18 +961,22 @@ __all__ = [
     "RuntimeStats",
     "StreamState",
     "append_audit",
+    "append_fingerprints",
     "append_local_memories",
     "flush_input_audit",
     "flush_prompt_audit",
     "flush_stats",
     "load_action_stats",
     "load_audit",
+    "load_fingerprints",
     "load_input_audit",
     "load_local_memories",
     "load_prompt_audit",
     "load_recall_stats",
+    "load_tool_names",
     "record_action",
     "record_input_audit",
     "record_prompt_audit",
     "record_recall",
+    "save_tool_names",
 ]

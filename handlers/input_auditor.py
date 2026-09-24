@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any
 
@@ -68,6 +69,51 @@ def _chars_of(obj: Any, depth: int = 0) -> int:
         return len(str(obj))
     except Exception:  # noqa: BLE001 - 算不出来就当 0
         return 0
+
+
+def _text_of(obj: Any, depth: int = 0) -> str:
+    """尽力把一个 payload 的内容拼成文本（算指纹用）。"""
+    if obj is None or depth > 5:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (int, float, bool)):
+        return str(obj)
+    if isinstance(obj, (list, tuple, set)):
+        return "".join(_text_of(item, depth + 1) for item in obj)
+    if isinstance(obj, dict):
+        return "".join(f"{k}{_text_of(v, depth + 1)}" for k, v in obj.items())
+    text = getattr(obj, "text", None)
+    if isinstance(text, str):
+        return text
+    for attr in ("content", "schema", "parameters", "description", "name"):
+        value = getattr(obj, attr, None)
+        if value is not None and not callable(value):
+            if isinstance(value, str):
+                return value
+            return _text_of(value, depth + 1)
+    try:
+        return str(obj)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _tool_name(tool: Any) -> str:
+    """尽力取工具/动作的名字（dict 或对象都吃）。"""
+    if isinstance(tool, dict):
+        for key in ("name", "tool_name", "function_name", "action_name"):
+            value = tool.get(key)
+            if value:
+                return str(value)
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            return str(function["name"])
+        return ""
+    for attr in ("name", "tool_name", "action_name"):
+        value = getattr(tool, attr, None)
+        if value:
+            return str(value)
+    return ""
 
 
 class InputAuditorHandler(BaseEventHandler):
@@ -130,8 +176,35 @@ class InputAuditorHandler(BaseEventHandler):
                 "payload_chars": payload_chars,
                 "total_chars": total_chars,
                 "roles": roles,
+                # 按请求名分组计数：这样即使在同一个统计里混着多种调用也分得清
+                "req": {request_name or "(未命名)": 1},
             }
             await state_module.record_input_audit(record)
+
+            # 记录 payload 指纹：有了「每轮每个 payload 的角色/长度/内容哈希」，
+            # 就能离线算出**第一个内容变化出现在第几个 payload** —— 那是缓存失效的起点，
+            # 也是「把易变内容挪到末尾」这件事到底值多少钱的依据。
+            fingerprints: list[dict[str, Any]] = []
+            for payload in payload_list:
+                role = str(getattr(payload, "role", "?") or "?")
+                text = _text_of(getattr(payload, "content", payload))
+                fingerprints.append(
+                    {
+                        "r": role[-14:],
+                        "n": len(text),
+                        "h": hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
+                        if text
+                        else "",
+                    }
+                )
+            await state_module.append_fingerprints(
+                {"at": record["at"], "req": request_name, "fp": fingerprints}
+            )
+
+            # 顺手记一份「这次到底暴露了哪些工具」——要决定砍谁，先得知道有什么。
+            names = sorted({_tool_name(tool) for tool in tool_list} - {""})
+            if names:
+                await state_module.save_tool_names(names)
 
             if config.plugin.debug_log:
                 logger.info(
