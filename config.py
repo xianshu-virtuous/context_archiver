@@ -193,9 +193,13 @@ class ContextArchiverConfig(BaseConfig):
             le=2.0,
         )
         max_tokens: int = Field(
-            default=1200,
-            description="输出上限（总结 + 记忆条目一起）。",
-            ge=200,
+            default=2500,
+            description=(
+                "输出上限（摘要 + 记忆条目一起）。\n"
+                "**别调太小**：实测 1200 会把 JSON 截断成非法格式，解析失败后整段内容被跳过，"
+                "等于白总结一次还把那段对话跳过去了。默认 2500。"
+            ),
+            ge=400,
             le=8000,
         )
 

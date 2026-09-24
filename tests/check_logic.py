@@ -138,12 +138,12 @@ def test_collect_messages() -> None:
             archiver.collect_messages("s", waterline_ts=0.0, max_messages=10)
         )
         check("超上限时截断标记为 True", truncated is True)
-        check("超上限时保留最新的那批（10 条）", len(messages) == 10, f"实际 {len(messages)}")
+        check("超上限时保留最早的 10 条", len(messages) == 10, f"实际 {len(messages)}")
         check(
-            "保留的是最新 10 条而非最旧",
+            "保留的是最早那批而非最新（否则更早的未归档消息会被永久跳过）",
             [m.time for m in messages] == sorted(m.time for m in messages)
-            and min(m.time for m in messages) == 991.0,
-            f"最早一条 {min(m.time for m in messages)}",
+            and min(m.time for m in messages) == 901.0,
+            f"范围 {min(m.time for m in messages)}~{max(m.time for m in messages)}",
         )
 
         # D. 读不到消息时返回空，且不抛异常

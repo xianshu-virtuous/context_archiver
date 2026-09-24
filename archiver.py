@@ -41,6 +41,10 @@ TRIGGER_MANUAL = "manual"
 #: 按轮数触发：累积够多就沉淀一次，**只写记忆、绝不清空**（话题可能还在继续）。
 TRIGGER_TURNS = "turns"
 
+#: 每流保留多少个已归档 message_id 用于去重。要 ≥ trigger.max_messages，
+#: 否则一次取满上限后，更早那批的 id 会被挤出去、导致重复总结。
+_ARCHIVED_ID_KEEP = 800
+
 _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊天记录压缩成两样东西：一份可以长期留存的摘要，以及若干条独立的记忆条目。
 
 硬性要求：
@@ -50,6 +54,8 @@ _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊�
 4. 不要复述原话，不要编造对话里没有的信息；不确定的就不要写。
 5. 标签三元组必须都给：core_tags（核心，1-3 个）、diffusion_tags（扩散，2-4 个）、opposing_tags（对立/反义，1-3 个）。
 6. memory_type 只能取：event（发生了什么）/ person（关于人的事实）/ knowledge（学到的知识）/ place（地点）/ procedure（做法、流程）。
+7. **务必控制在输出上限内**：摘要 300 字以内，记忆 **最多 5 条**、按重要性取前几条即可。
+   宁可少写几条，也不要让 JSON 被截断——被截断的输出等于什么都没总结。
 
 输出格式：
 {
@@ -168,6 +174,15 @@ def _message_time(message: Any) -> float:
     return 0.0
 
 
+def _message_id(message: Any) -> str:
+    """取消息的唯一标识（去重以此为准，不用时间戳）。"""
+    for attr in ("message_id", "id"):
+        value = getattr(message, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
 def _message_person(message: Any) -> str:
     """尽力取出说话人 id。"""
     for attr in ("person_id", "user_id", "sender_id"):
@@ -207,23 +222,29 @@ def _clock(ts: float) -> str:
 async def collect_messages(
     stream_id: str,
     *,
-    waterline_ts: float,
+    waterline_ts: float = 0.0,
+    exclude_ids: set[str] | None = None,
     max_messages: int,
 ) -> tuple[list[Any], bool]:
-    """取水位线之后的消息（按时间升序）。
+    """取还没归档过的消息（按时间升序）。
 
-    **分页取全，而不是只取一页**：``get_stream_messages`` 是按 ``-id`` 倒序返回的，
-    只取一页会拿到「最新的 N 条」——如果水位线之后的消息比 N 还多，
-    剩下的那些会在水位线推进后被永久跳过（总结不到、也清掉了）。所以这里一直翻页
-    翻到「遇到比水位线旧的消息」或「翻完」为止。
+    **去重以 ``message_id`` 为准**（``exclude_ids``），时间戳只当**安全下界**。
+
+    为什么不用时间戳做水位线：实测 ``Message.time`` 与数据库里的 ``time`` 不是同一套
+    时钟，用「本批最晚一条」推水位线会把它推到未来（实测超前 94 秒），之后每次巡检
+    都认为「水位线之后没有新消息」——**新对话永远归档不了**。这个坑踩过一次。
+
+    翻页时从最新往回找，遇到「已归档过的 id」就停；这样既不重复总结，
+    也不会跳过更早的未归档消息。
 
     Args:
         stream_id: 聊天流标识。
-        waterline_ts: 已归档水位线；只取比它新的消息。
-        max_messages: 最多取多少条（仍然超出时保留最新的那批，并回报截断）。
+        waterline_ts: 已归档的**最早**时间（安全下界）；比它还旧的一律不看。
+        exclude_ids: 已归档的 message_id 集合。
+        max_messages: 单次最多取多少条（超出时取最早的，并在水位线上留出重叠）。
 
     Returns:
-        ``(消息列表按时间升序, 是否被截断)``。读取失败时返回 ``([], False)``。
+        ``(消息列表按时间升序, 是否被截断)``。
     """
     cap = max(10, min(int(max_messages), 5000))
     page_size = 100
@@ -231,6 +252,7 @@ async def collect_messages(
     max_pages = 60
 
     collected: list[Any] = []
+    blocked = exclude_ids or set()
     floor = float(waterline_ts or 0.0)
     truncated = False
 
@@ -243,17 +265,21 @@ async def collect_messages(
             if not raw:
                 break
 
-            hit_old = False
+            hit_known = False
             for message in raw:
-                if float(_message_time(message)) <= floor:
-                    hit_old = True
+                memory_id = _message_id(message)
+                if memory_id and memory_id in blocked:
+                    # 倒序翻页时遇到已归档的消息，说明它后面的（更旧的）也处理过了
+                    hit_known = True
+                    break
+                if floor > 0 and float(_message_time(message)) <= floor:
+                    hit_known = True
                     break
                 collected.append(message)
 
-            if hit_old or len(raw) < page_size:
+            if hit_known or len(raw) < page_size:
                 break
             if len(collected) >= cap:
-                # 还有更早的未归档消息没取到——记下来，后面要靠它决定「不许清空」。
                 truncated = True
                 break
     except Exception as error:  # noqa: BLE001 - 读不到消息就当没有可归档内容
@@ -262,7 +288,9 @@ async def collect_messages(
 
     collected.sort(key=_message_time)
     if len(collected) > cap:
-        collected = collected[-cap:]
+        # 取**最早**的 cap 条，不是最新的！
+        # 取最新会让更早的未归档消息在水位线推进后被永久跳过（没总结、也没记忆）。
+        collected = collected[:cap]
         truncated = True
     return collected, truncated
 
@@ -544,6 +572,7 @@ async def archive_stream(
     messages, truncated = await collect_messages(
         stream_id,
         waterline_ts=float(stream_state.waterline_ts or 0.0),
+        exclude_ids=set(stream_state.archived_ids or []),
         max_messages=int(config.trigger.max_messages),
     )
     snapshot.truncated = truncated
@@ -597,11 +626,22 @@ async def archive_stream(
         return snapshot
 
     payload = llm_module.extract_json(result.text)
-    summary, items, _ended = _parse_summary_payload(
-        payload,
-        fallback_summary=result.text[: int(config.archive.summary_max_chars)],
-    )
+    if payload is None:
+        # 解析失败 = 这次总结没有产出任何可用的东西（最常见原因是被 max_tokens 截断）。
+        # **绝不能当成功**：那会推进水位线，让这段对话再也不会被总结 —— 永久跳过。
+        snapshot.error = "模型输出不是合法 JSON（多半被 max_tokens 截断）"
+        logger.warning(
+            f"[context_archiver] 总结输出解析失败，水位线不推进（stream={stream_id[:8]}，"
+            f"输出 {len(result.text)} 字符）"
+        )
+        await _write_audit(config, snapshot, summary="")
+        return snapshot
+
+    summary, items, _ended = _parse_summary_payload(payload, fallback_summary="")
     summary = summary[: int(config.archive.summary_max_chars)]
+    if not summary:
+        # 模型没给摘要就保留上一次的——别把之前写好的摘要冲成空串。
+        summary = str(stream_state.summary or "")
     snapshot.summary = summary
 
     for item in items:
@@ -658,7 +698,12 @@ async def archive_stream(
     snapshot.ok = bool(sink_result.ok)
 
     # ── 状态推进 ────────────────────────────────────────────────────────────
-    stream_state.waterline_ts = float(end_ts)
+    # 去重靠 message_id 集合（Message.time 与数据库 time 不同源，时间戳不可信）；
+    # 水位线只留「本批最早一条」当安全下界，宁可下次重叠也不超前。
+    batch_ids = [_message_id(m) for m in messages if _message_id(m)]
+    merged_ids = list(dict.fromkeys(list(stream_state.archived_ids or []) + batch_ids))
+    stream_state.archived_ids = merged_ids[-_ARCHIVED_ID_KEEP:]
+    stream_state.waterline_ts = float(start_ts)
     stream_state.summary = summary
     stream_state.summary_updated_at = time.time()
     stream_state.last_archive_at = time.time()

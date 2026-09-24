@@ -62,7 +62,11 @@ class StreamState:
         end_signal_at: 最近一次收到结束信号（stop_conversation）的时刻。
         end_signal_name: 结束信号的动作名。
         pending_count: 自上次归档以来累计的消息条数。
-        waterline_ts: 已归档到的水位线（消息时间戳）；归档只处理比它新的消息。
+        waterline_ts: 已归档水位线的**安全下界**：用本批**最早**一条消息的时间，
+            宁可下次重叠（靠 ``archived_ids`` 去重）也绝不超前——实测用「最晚一条」
+            会把水位线推到比数据库还晚，之后所有巡检查都认为「没有新消息」。
+        archived_ids: 最近已归档的 ``message_id``（精确定重）。时间戳不可靠，
+            去重以这个为准。
         last_archive_at: 最近一次归档时刻。
         archive_count: 本流累计归档次数。
         summary: 滚动摘要——清空上下文后，靠它让 Bot 还记得这段聊过什么。
@@ -86,6 +90,7 @@ class StreamState:
     summary_updated_at: float = 0.0
     last_observer_log_at: float = 0.0
     last_settled_signal_at: float = 0.0
+    archived_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可落盘的字典。"""
@@ -125,6 +130,13 @@ class StreamState:
             summary_updated_at=_num("summary_updated_at"),
             last_observer_log_at=_num("last_observer_log_at"),
             last_settled_signal_at=_num("last_settled_signal_at"),
+            archived_ids=[
+                str(item)
+                for item in (data.get("archived_ids") or [])
+                if str(item).strip()
+            ]
+            if isinstance(data.get("archived_ids"), list)
+            else [],
         )
 
 
