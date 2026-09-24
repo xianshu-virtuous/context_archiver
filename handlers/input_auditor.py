@@ -188,15 +188,25 @@ class InputAuditorHandler(BaseEventHandler):
             for payload in payload_list:
                 role = str(getattr(payload, "role", "?") or "?")
                 text = _text_of(getattr(payload, "content", payload))
-                fingerprints.append(
-                    {
-                        "r": role[-14:],
-                        "n": len(text),
-                        "h": hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
-                        if text
-                        else "",
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "r": role[-14:],
+                    "n": len(text),
+                    "h": hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
+                    if text
+                    else "",
+                }
+                # payload 级的哈希分不出「变化出现在它内部的哪个位置」。
+                # USER 里混着历史（稳定）+ 新消息与注入（易变），所以再记前若干个字符的
+                # 分段哈希：哪一段开始不同，就说明缓存从那里断掉、后面全废。
+                # 若前 2000 字符就变了 → 注入插在了历史前面，历史被冲掉（有肉可吃）；
+                # 若只有整段哈希不同、前 32000 都一样 → 变化在尾部，已经是最优布局。
+                if text and "USER" in role.upper():
+                    for mark in (2000, 8000, 32000):
+                        if len(text) >= mark:
+                            entry[f"p{mark}"] = hashlib.sha1(
+                                text[:mark].encode("utf-8", "ignore")
+                            ).hexdigest()[:12]
+                fingerprints.append(entry)
             await state_module.append_fingerprints(
                 {"at": record["at"], "req": request_name, "fp": fingerprints}
             )
