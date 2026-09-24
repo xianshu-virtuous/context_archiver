@@ -124,6 +124,7 @@ class StreamSnapshot:
     sink: str = ""
     cleared: bool = False
     fallback_used: bool = False
+    truncated: bool = False
     error: str = ""
     dry_run: bool = False
 
@@ -141,6 +142,7 @@ class StreamSnapshot:
             "sink": self.sink,
             "cleared": self.cleared,
             "fallback_used": self.fallback_used,
+            "truncated": self.truncated,
             "error": self.error,
             "dry_run": self.dry_run,
         }
@@ -205,30 +207,62 @@ async def collect_messages(
     *,
     waterline_ts: float,
     max_messages: int,
-) -> list[Any]:
+) -> tuple[list[Any], bool]:
     """取水位线之后的消息（按时间升序）。
+
+    **分页取全，而不是只取一页**：``get_stream_messages`` 是按 ``-id`` 倒序返回的，
+    只取一页会拿到「最新的 N 条」——如果水位线之后的消息比 N 还多，
+    剩下的那些会在水位线推进后被永久跳过（总结不到、也清掉了）。所以这里一直翻页
+    翻到「遇到比水位线旧的消息」或「翻完」为止。
 
     Args:
         stream_id: 聊天流标识。
         waterline_ts: 已归档水位线；只取比它新的消息。
-        max_messages: 最多取多少条（取最近的那一批）。
+        max_messages: 最多取多少条（仍然超出时保留最新的那批，并回报截断）。
 
     Returns:
-        消息列表；读取失败返回空列表。
+        ``(消息列表按时间升序, 是否被截断)``。读取失败时返回 ``([], False)``。
     """
-    limit = max(10, min(int(max_messages), 5000))
+    cap = max(10, min(int(max_messages), 5000))
+    page_size = 100
+    #: 翻页硬上限，防止历史极长时把一次巡检拖死。
+    max_pages = 60
+
+    collected: list[Any] = []
+    floor = float(waterline_ts or 0.0)
+    truncated = False
+
     try:
-        raw = await stream_api.get_stream_messages(stream_id, limit=limit, offset=0)
+        for page in range(max_pages):
+            offset = page * page_size
+            raw = await stream_api.get_stream_messages(
+                stream_id, limit=page_size, offset=offset
+            )
+            if not raw:
+                break
+
+            hit_old = False
+            for message in raw:
+                if float(_message_time(message)) <= floor:
+                    hit_old = True
+                    break
+                collected.append(message)
+
+            if hit_old or len(raw) < page_size:
+                break
+            if len(collected) >= cap:
+                # 还有更早的未归档消息没取到——记下来，后面要靠它决定「不许清空」。
+                truncated = True
+                break
     except Exception as error:  # noqa: BLE001 - 读不到消息就当没有可归档内容
         logger.warning(f"[context_archiver] 读取流消息失败（{stream_id[:8]}）: {error}")
-        return []
+        return [], False
 
-    messages = [m for m in (raw or []) if m is not None]
-    messages.sort(key=_message_time)
-    floor = float(waterline_ts or 0.0)
-    if floor > 0:
-        messages = [m for m in messages if _message_time(m) > floor]
-    return messages
+    collected.sort(key=_message_time)
+    if len(collected) > cap:
+        collected = collected[-cap:]
+        truncated = True
+    return collected, truncated
 
 
 def build_digest(messages: list[Any], *, max_chars: int) -> str:
@@ -453,7 +487,6 @@ def _parse_summary_payload(
 
 
 async def archive_stream(
-    plugin: Any,
     stream_id: str,
     *,
     trigger: str,
@@ -464,7 +497,6 @@ async def archive_stream(
     """对单个流执行一次归档。
 
     Args:
-        plugin: 插件实例（审计与状态用）。
         stream_id: 聊天流标识。
         trigger: 触发类型（结束信号 / 闲置 / 手动）。
         config: 插件配置。
@@ -477,11 +509,12 @@ async def archive_stream(
     snapshot = StreamSnapshot(stream_id=stream_id, trigger=trigger, dry_run=dry_run)
     stream_state = await state_module.ArchiveStateStore.get(stream_id, fresh=True)
 
-    messages = await collect_messages(
+    messages, truncated = await collect_messages(
         stream_id,
         waterline_ts=float(stream_state.waterline_ts or 0.0),
         max_messages=int(config.trigger.max_messages),
     )
+    snapshot.truncated = truncated
     snapshot.message_count = len(messages)
     if not messages:
         snapshot.error = "水位线之后没有新消息"
@@ -562,9 +595,15 @@ async def archive_stream(
     snapshot.memory_ids = list(sink_result.memory_ids)
     snapshot.fallback_used = sink_result.fallback_used
 
-    # ── 清空：只在记忆落地成功之后 ──────────────────────────────────────────
+    # ── 清空：只在记忆落地成功、且没有截断风险时 ────────────────────────────
     cleared = False
-    if config.archive.clear_context_enabled:
+    if config.archive.clear_context_enabled and truncated:
+        logger.warning(
+            f"[context_archiver] 消息数超过单次上限（{snapshot.message_count} 条），"
+            f"为避免推进水位线跳过更早的未归档消息，本次保守跳过清空（{stream_id[:8]}）"
+        )
+        snapshot.error = "消息被截断，已跳过清空（保守）"
+    elif config.archive.clear_context_enabled:
         if sink_result.ok:
             try:
                 cleared = bool(await stream_api.load_and_clear_context(stream_id))
@@ -696,7 +735,6 @@ async def tick(config: ContextArchiverConfig, *, now: float | None = None) -> li
             continue
 
         snapshot = await archive_stream(
-            None,
             stream_id,
             trigger=decision.trigger,
             config=config,

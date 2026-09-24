@@ -140,7 +140,6 @@ class ContextArchiverService(BaseService):
             归档快照字典。
         """
         snapshot = await archiver.archive_stream(
-            self.plugin,
             stream_id,
             trigger=trigger,
             config=self.config,

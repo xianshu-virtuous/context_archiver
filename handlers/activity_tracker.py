@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -90,12 +91,10 @@ class ActivityTrackerHandler(BaseEventHandler):
             kind: 活跃来源（写状态与日志用）。
             count_message: 是否计入待归档消息数（只有真正的消息事件才计）。
         """
-        import time as _time
-
         if not stream_id:
             return
         stream_state = await state_module.ArchiveStateStore.get(stream_id)
-        stream_state.last_activity_at = _time.time()
+        stream_state.last_activity_at = time.time()
         stream_state.last_activity_kind = kind
         if count_message:
             stream_state.pending_count = int(stream_state.pending_count or 0) + 1
@@ -106,12 +105,10 @@ class ActivityTrackerHandler(BaseEventHandler):
 
     async def _mark_end_signal(self, stream_id: str, action_name: str) -> None:
         """记录一次结束信号。"""
-        import time as _time
-
         if not stream_id:
             return
         stream_state = await state_module.ArchiveStateStore.get(stream_id)
-        stream_state.end_signal_at = _time.time()
+        stream_state.end_signal_at = time.time()
         stream_state.end_signal_name = action_name
         stream_state.last_activity_at = stream_state.end_signal_at
 
