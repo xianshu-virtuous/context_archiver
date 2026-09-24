@@ -755,13 +755,17 @@ async def tick(config: ContextArchiverConfig, *, now: float | None = None) -> li
                 )
             continue
 
-        quiet_ok, quiet_reason = await global_quiet_ok(config)
-        if not quiet_ok:
-            if config.plugin.debug_log:
-                logger.info(
-                    f"[context_archiver] stream={stream_id[:8]} 暂不归档：{quiet_reason}"
-                )
-            continue
+        # 轮数触发是「聊着也要沉淀」，**不受全局静默限制**——
+        # 否则 require_global_quiet 会永远把它挡死（聊天时全局从来不静默，
+        # 实测 pending 涨到 169 却一次都没归档，就是因为这个）。
+        if decision.trigger != TRIGGER_TURNS:
+            quiet_ok, quiet_reason = await global_quiet_ok(config)
+            if not quiet_ok:
+                if config.plugin.debug_log:
+                    logger.info(
+                        f"[context_archiver] stream={stream_id[:8]} 暂不归档：{quiet_reason}"
+                    )
+                continue
 
         snapshot = await archive_stream(
             stream_id,

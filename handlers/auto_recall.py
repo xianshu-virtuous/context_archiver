@@ -27,18 +27,30 @@ logger = get_logger("context_archiver.auto_recall")
 
 
 async def _person_id_of(stream_id: str) -> str:
-    """取该聊天流的对话者 id（人物路要用）。"""
+    """取该聊天流的对话者 id——**只在私聊有意义**。
+
+    群聊没有单一对话者：实测群聊流的 ``person_id`` 就是 ``stream_id`` 的哈希，
+    拿它去查记忆必然 0 命中（还会白白多一次数据库查询）。
+    所以群聊直接返回空串，让人物路安静跳过，只走近因路。
+    """
     if not stream_id:
         return ""
     try:
         info = await stream_api.get_stream_info(stream_id)
     except Exception:  # noqa: BLE001 - 拿不到就不走人物路
         return ""
-    if isinstance(info, dict):
-        for key in ("person_id", "user_id", "target_id"):
-            value = info.get(key)
-            if value:
-                return str(value)
+    if not isinstance(info, dict):
+        return ""
+
+    group_id = info.get("group_id")
+    chat_type = str(info.get("chat_type") or "").lower()
+    if group_id or chat_type == "group":
+        return ""
+
+    for key in ("person_id", "user_id", "target_id"):
+        value = info.get(key)
+        if value:
+            return str(value)
     return ""
 
 
