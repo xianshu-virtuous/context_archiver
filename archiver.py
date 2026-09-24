@@ -619,12 +619,15 @@ async def archive_stream(
 
     payload = llm_module.extract_json(result.text)
     if payload is None:
-        # 解析失败 = 这次总结没有产出任何可用的东西（最常见原因是被 max_tokens 截断）。
+        # 解析失败 = 这次总结没有产出任何可用的东西。
         # **绝不能当成功**：那会推进水位线，让这段对话再也不会被总结 —— 永久跳过。
-        snapshot.error = "模型输出不是合法 JSON（多半被 max_tokens 截断）"
+        # 把原文前 400 字符打进日志：不给原文就查不出「模型到底吐了什么」。
+        preview = result.text[:400].replace("\n", " ⏎ ").replace("\r", "")
+        snapshot.error = "模型输出不是合法 JSON"
         logger.warning(
-            f"[context_archiver] 总结输出解析失败，水位线不推进（stream={stream_id[:8]}，"
-            f"输出 {len(result.text)} 字符）"
+            f"[context_archiver] 总结输出解析失败，水位线不推进"
+            f"（stream={stream_id[:8]}，输出 {len(result.text)} 字符）"
+            f"原文预览：{preview}"
         )
         await _write_audit(config, snapshot, summary="")
         return snapshot
