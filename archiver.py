@@ -353,19 +353,28 @@ def evaluate(
             reason=f"结束信号等待落库中（{int(waited)}s < {trigger_cfg.settle_seconds}s）",
         )
 
-    last_activity = float(stream_state.last_activity_at or 0.0)
-    if last_activity > 0:
-        idle = current - last_activity
+    # 判定基准是「**Bot 已经多久没参与**」，不是「流多久没动静」。
+    # 群聊一直有人说话时 last_activity_at 永远在刷新，按它判就永远不会归档；
+    # 而 last_engagement_at 只由 Bot 自己发言刷新，它才反映「Bot 是不是在潜水」。
+    engagement = float(stream_state.last_engagement_at or 0.0)
+    fallback = float(stream_state.last_activity_at or 0.0)
+    base_at = engagement or fallback
+
+    if base_at > 0:
+        idle = current - base_at
         if idle >= int(trigger_cfg.idle_seconds):
+            basis = "Bot 上次发言" if engagement else "尚无发言记录，按流活跃算"
             return ArchiveDecision(
                 should=True,
-                reason=f"静默 {int(idle)}s（阈值 {trigger_cfg.idle_seconds}s）",
+                reason=(
+                    f"Bot 已 {int(idle)}s 没参与"
+                    f"（阈值 {trigger_cfg.idle_seconds}s；{basis}）"
+                ),
                 trigger=TRIGGER_IDLE,
             )
 
-    # 轮数触发：话题可能还在继续，但这段该沉淀进记忆了。
-    # 这条是「提高写记忆频率」的主路径，且它**只写记忆、不清空上下文**
-    # —— 话题还活着，清空会切断对话。
+    # 轮数触发（可选，默认关）：话题可能还在继续，但这段该沉淀了。
+    # 它只写记忆、不清空上下文 —— 话题还活着，清空会切断对话。
     if trigger_cfg.turn_trigger_enabled and stream_state.pending_count >= int(
         trigger_cfg.turn_threshold
     ):
@@ -378,12 +387,12 @@ def evaluate(
             trigger=TRIGGER_TURNS,
         )
 
-    if last_activity > 0:
-        idle = current - last_activity
+    if base_at > 0:
+        idle = current - base_at
         return ArchiveDecision(
             should=False,
             reason=(
-                f"仍然活跃（静默 {int(idle)}s < {trigger_cfg.idle_seconds}s，"
+                f"Bot 刚参与过（{int(idle)}s 前，阈值 {trigger_cfg.idle_seconds}s，"
                 f"累积 {stream_state.pending_count} 条）"
             ),
         )

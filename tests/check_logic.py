@@ -301,48 +301,72 @@ def test_evaluate_edges() -> None:
     )
     check("没有活跃记录且消息不足 → 不归档", decision.should is False)
 
-    # 轮数触发：没有结束信号、也没静默，但累积够了就沉淀（只写记忆、不清空）
-    turn_threshold = int(config.trigger.turn_threshold)
+    # ★ 核心场景 A：群聊一直有人说话（last_activity 刚刷新），但 Bot 潜水很久
+    #    —— 判定基准必须是「Bot 有没有参与」，否则群聊永远不会归档。
     decision = archiver.evaluate(
         st.StreamState(
-            stream_id="t",
-            pending_count=turn_threshold,
+            stream_id="g",
+            pending_count=50,
             last_activity_at=now - 5,
+            last_engagement_at=now - 2000,
         ),
         config,
         now=now,
     )
     check(
-        "累积够轮数 → 触发轮数归档",
-        decision.should is True and decision.trigger == "turns",
-        f"{decision.should} / {decision.trigger}",
+        "群聊热闹但 Bot 潜水超阈值 → 归档",
+        decision.should is True and decision.trigger == "idle",
+        f"{decision.should} / {decision.trigger} / {decision.reason}",
     )
 
-    # 轮数差一条且仍在活跃 → 不归档
+    # ★ 核心场景 B：流安静很久，但 Bot 刚说过话 → 不该归档
     decision = archiver.evaluate(
         st.StreamState(
-            stream_id="u",
-            pending_count=max(1, turn_threshold - 1),
-            last_activity_at=now - 5,
+            stream_id="h",
+            pending_count=50,
+            last_activity_at=now - 3000,
+            last_engagement_at=now - 60,
         ),
         config,
         now=now,
     )
-    check("轮数不够且活跃 → 不归档", decision.should is False, decision.reason)
+    check(
+        "Bot 刚参与过 → 不归档（哪怕流安静很久）",
+        decision.should is False,
+        decision.reason,
+    )
 
-    # 关掉轮数触发后，同样的状态不该归档
+    # 轮数触发默认关闭；显式打开后才生效
+    turn_threshold = int(config.trigger.turn_threshold)
+    config.trigger.turn_trigger_enabled = True
+    decision = archiver.evaluate(
+        st.StreamState(
+            stream_id="t",
+            pending_count=turn_threshold,
+            last_activity_at=now - 5,
+            last_engagement_at=now - 5,
+        ),
+        config,
+        now=now,
+    )
+    check(
+        "打开轮数触发后，累积够 → 轮数归档",
+        decision.should is True and decision.trigger == "turns",
+        f"{decision.should} / {decision.trigger}",
+    )
+
     config.trigger.turn_trigger_enabled = False
     decision = archiver.evaluate(
         st.StreamState(
             stream_id="v",
             pending_count=turn_threshold * 3,
             last_activity_at=now - 5,
+            last_engagement_at=now - 5,
         ),
         config,
         now=now,
     )
-    check("关掉轮数触发后不再轮数归档", decision.should is False, decision.reason)
-    config.trigger.turn_trigger_enabled = True
+    check("默认关闭时不做轮数归档", decision.should is False, decision.reason)
 
     # 结束信号优先于「仍然活跃」
     decision = archiver.evaluate(

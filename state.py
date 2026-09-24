@@ -53,8 +53,12 @@ class StreamState:
 
     Attributes:
         stream_id: 聊天流标识。
-        last_activity_at: 最近一次活跃时刻（收到/发出消息、或动作触发）。
+        last_activity_at: 最近一次活跃时刻（**流里任何一条消息**，含别人之间说的话）。
         last_activity_kind: 最近一次活跃的来源，排查用。
+        last_engagement_at: 最近一次 **Bot 自己参与** 的时刻（它发了消息）。
+            —— 这是写记忆的判定基准：群里一直有人说话时 ``last_activity_at``
+            永远在刷新，只有 ``last_engagement_at`` 能反映「Bot 已经潜水多久」。
+        last_engagement_kind: 参与来源。
         end_signal_at: 最近一次收到结束信号（stop_conversation）的时刻。
         end_signal_name: 结束信号的动作名。
         pending_count: 自上次归档以来累计的消息条数。
@@ -70,6 +74,8 @@ class StreamState:
     stream_id: str = ""
     last_activity_at: float = 0.0
     last_activity_kind: str = ""
+    last_engagement_at: float = 0.0
+    last_engagement_kind: str = ""
     end_signal_at: float = 0.0
     end_signal_name: str = ""
     pending_count: int = 0
@@ -107,6 +113,8 @@ class StreamState:
             stream_id=str(data.get("stream_id") or ""),
             last_activity_at=_num("last_activity_at"),
             last_activity_kind=str(data.get("last_activity_kind") or ""),
+            last_engagement_at=_num("last_engagement_at"),
+            last_engagement_kind=str(data.get("last_engagement_kind") or ""),
             end_signal_at=_num("end_signal_at"),
             end_signal_name=str(data.get("end_signal_name") or ""),
             pending_count=_int("pending_count"),

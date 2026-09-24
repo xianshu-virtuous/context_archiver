@@ -83,6 +83,7 @@ class ActivityTrackerHandler(BaseEventHandler):
         *,
         kind: str,
         count_message: bool,
+        engage: bool = False,
     ) -> None:
         """刷新某个流的活跃状态。
 
@@ -90,12 +91,17 @@ class ActivityTrackerHandler(BaseEventHandler):
             stream_id: 聊天流标识。
             kind: 活跃来源（写状态与日志用）。
             count_message: 是否计入待归档消息数（只有真正的消息事件才计）。
+            engage: 是否算「Bot 自己参与」（只有 Bot 发言才算）。
         """
         if not stream_id:
             return
         stream_state = await state_module.ArchiveStateStore.get(stream_id)
         stream_state.last_activity_at = time.time()
         stream_state.last_activity_kind = kind
+        if engage:
+            # 判定基准：Bot 潜水多久了。群里别人一直说话不会刷新它。
+            stream_state.last_engagement_at = stream_state.last_activity_at
+            stream_state.last_engagement_kind = kind
         if count_message:
             stream_state.pending_count = int(stream_state.pending_count or 0) + 1
 
@@ -111,6 +117,9 @@ class ActivityTrackerHandler(BaseEventHandler):
         stream_state.end_signal_at = time.time()
         stream_state.end_signal_name = action_name
         stream_state.last_activity_at = stream_state.end_signal_at
+        # Bot 主动结束对话，也算它参与了这一轮。
+        stream_state.last_engagement_at = stream_state.end_signal_at
+        stream_state.last_engagement_kind = f"end:{action_name}"
 
         states = await state_module.ArchiveStateStore.load_all()
         states[stream_id] = stream_state
@@ -159,7 +168,13 @@ class ActivityTrackerHandler(BaseEventHandler):
                 if event_name == EventType.ON_MESSAGE_RECEIVED
                 else "message_sent"
             )
-            await self._touch(stream_id, kind=kind, count_message=True)
+            # 只有 Bot 自己发消息才算「参与」——别人之间说话只刷新活跃。
+            await self._touch(
+                stream_id,
+                kind=kind,
+                count_message=True,
+                engage=(kind == "message_sent"),
+            )
         except Exception as error:  # noqa: BLE001 - 记录失败绝不能影响消息链路
             logger.warning(f"[context_archiver] 活跃追踪失败: {error}")
 
