@@ -236,6 +236,15 @@ class ContextArchiverConfig(BaseConfig):
             ge=10,
             le=5000,
         )
+        prompt_audit_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否逐轮记录 user prompt 各板块的字符数（history / unreads / extra）。\n"
+                "用来回答「钱花在哪」：实测每轮输入里全价（未命中缓存）的部分约 8,561 token、"
+                "占总成本 74%，而且与历史长度无关——那它只可能来自每轮变化的内容。\n"
+                "只读统计，不改动 prompt，不拦截事件。"
+            ),
+        )
 
     @config_section("observer")
     class ObserverSection(SectionBase):

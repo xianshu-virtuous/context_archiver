@@ -39,6 +39,7 @@ _HELP = """【上下文归档器】
 /归档                状态总览
 /归档 状态           同上
 /归档 审计           最近几次归档记录
+/归档 注入           提示词构成归因（钱花在哪）
 /归档 流             当前流的详细状态
 /归档 演练           只总结不落盘（预演）
 /归档 现在           立刻归档当前流
@@ -164,6 +165,41 @@ class ArchiveCommand(BaseCommand):
     async def handle_audit_en(self) -> tuple[bool, str]:
         """审计（英文别名）。"""
         return await self.handle_audit()
+
+    @cmd_route("注入")
+    async def handle_prompt_audit(self) -> tuple[bool, str]:
+        """提示词构成归因：每轮的钱花在哪。"""
+        service = self._get_service()
+        data = await service.prompt_audit()
+        samples = int(data.get("samples") or 0)
+        if not samples:
+            await self._reply("还没有采样——等 prompt 构建跑过几轮再看。")
+            return True, "empty"
+
+        avg = data.get("avg_chars") or {}
+
+        def tok(chars: int) -> int:
+            """字符数粗估 token（中文约 1 token ≈ 1.5 字符）。"""
+            return int(chars / 1.5)
+
+        lines = [
+            f"【提示词构成归因】{samples} 轮采样",
+            f"  history {avg.get('history', 0):>7,} 字符 ≈ {tok(avg.get('history', 0)):>6,} tok",
+            f"  unreads {avg.get('unreads', 0):>7,} 字符 ≈ {tok(avg.get('unreads', 0)):>6,} tok",
+            f"  extra   {avg.get('extra', 0):>7,} 字符 ≈ {tok(avg.get('extra', 0)):>6,} tok ← 各插件注入",
+            f"  other   {avg.get('other', 0):>7,} 字符",
+            f"  合计    {avg.get('total', 0):>7,} 字符 ≈ {tok(avg.get('total', 0)):>6,} tok",
+            "",
+            "对照：实测每轮「全价」输入约 8,561 tok（占总成本 74%），",
+            "且与历史长度无关 → extra 越接近它，钱就越是花在插件注入上。",
+        ]
+        await self._reply("\n".join(lines))
+        return True, "prompt-audit"
+
+    @cmd_route("inject")
+    async def handle_prompt_audit_en(self) -> tuple[bool, str]:
+        """注入归因（英文别名）。"""
+        return await self.handle_prompt_audit()
 
     @cmd_route("流")
     async def handle_stream(self) -> tuple[bool, str]:

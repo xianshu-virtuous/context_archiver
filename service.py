@@ -122,6 +122,37 @@ class ContextArchiverService(BaseService):
         records = await state_module.load_audit()
         return [record.to_dict() for record in records[: max(1, int(limit))]]
 
+    async def prompt_audit(self) -> dict[str, Any]:
+        """提示词构成的归因统计（回答「每轮的钱花在哪」）。
+
+        先强制落盘缓冲，保证拿到的是最新数据。
+
+        Returns:
+            含 ``samples`` / ``avg_chars``（各板块平均字符数）的字典。
+        """
+        await state_module.flush_prompt_audit()
+        data = await state_module.load_prompt_audit()
+        samples = int(data.get("samples") or 0)
+        raw_sums = data.get("sums")
+        sums: dict[str, Any] = raw_sums if isinstance(raw_sums, dict) else {}
+
+        fields = ("history", "unreads", "extra", "extra_info", "other", "total")
+        avg_chars: dict[str, int] = {}
+        for key in fields:
+            try:
+                avg_chars[key] = round(int(sums.get(key) or 0) / samples) if samples else 0
+            except (TypeError, ValueError):
+                avg_chars[key] = 0
+
+        recent = data.get("recent")
+        return {
+            "samples": samples,
+            "avg_chars": avg_chars,
+            "first_at": float(data.get("first_at") or 0.0),
+            "last_at": float(data.get("last_at") or 0.0),
+            "recent": recent if isinstance(recent, list) else [],
+        }
+
     async def archive_now(
         self,
         stream_id: str,

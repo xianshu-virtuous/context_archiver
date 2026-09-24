@@ -394,18 +394,157 @@ async def load_local_memories() -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
+# --------------------------------------------------------------------------- #
+# 存储：提示词归因审计
+# --------------------------------------------------------------------------- #
+
+#: 提示词归因审计的存储键。
+PROMPT_AUDIT_KEY = "prompt_audit"
+
+#: 归因审计保留的最近样本条数。
+_PROMPT_AUDIT_KEEP = 40
+
+#: 需要累加的字段。
+_AUDIT_FIELDS: tuple[str, ...] = ("history", "unreads", "extra", "extra_info", "other", "total")
+
+
+class PromptAuditBuffer:
+    """提示词归因的内存缓冲。
+
+    ``on_prompt_build`` 在请求构建的同步路径上，每轮直接读改写 json 会给首字
+    延迟添上几十毫秒。所以先攒在内存里，攒够条数或过了间隔再落盘一次——
+    审计数据丢几个样本无所谓，拖慢对话不行。
+
+    缓冲挂在**类属性**上：框架每次 ``get_service()`` 都新建服务实例，
+    实例属性带不走。
+    """
+
+    #: 待落盘的样本。
+    pending: list[dict[str, Any]] = []
+
+    #: 最近一次落盘的单调时钟读数。
+    last_flush_mono: float = -1.0e9
+
+    #: 攒够多少条就落盘。
+    flush_size: int = 8
+
+    #: 最长多久落盘一次（秒）。
+    flush_interval: float = 20.0
+
+
+async def record_prompt_audit(record: dict[str, Any]) -> bool:
+    """记录一条提示词构成样本（内存缓冲 + 定期落盘）。
+
+    Args:
+        record: 单轮样本，含 history / unreads / extra / other / total 等字符数。
+
+    Returns:
+        本次调用是否触发了落盘。
+    """
+    buffer = PromptAuditBuffer
+    buffer.pending.append(record)
+
+    now = time.monotonic()
+    due = (
+        len(buffer.pending) >= buffer.flush_size
+        or (now - buffer.last_flush_mono) >= buffer.flush_interval
+    )
+    if not due:
+        return False
+
+    pending = list(buffer.pending)
+    buffer.pending.clear()
+    buffer.last_flush_mono = now
+    return await _flush_prompt_audit(pending)
+
+
+async def _flush_prompt_audit(samples: list[dict[str, Any]]) -> bool:
+    """把缓冲区里的样本并进滚动统计并落盘。"""
+    if not samples:
+        return False
+
+    try:
+        raw = await storage_api.load_json(STORE_NAME, PROMPT_AUDIT_KEY)
+    except Exception:  # noqa: BLE001 - 读不到按空处理
+        raw = None
+    data = raw if isinstance(raw, dict) else {}
+
+    total_samples = int(data.get("samples") or 0)
+    sums: dict[str, int] = {}
+    raw_sums = data.get("sums")
+    if isinstance(raw_sums, dict):
+        for key in _AUDIT_FIELDS:
+            try:
+                sums[key] = int(raw_sums.get(key) or 0)
+            except (TypeError, ValueError):
+                sums[key] = 0
+    else:
+        sums = {key: 0 for key in _AUDIT_FIELDS}
+
+    for item in samples:
+        total_samples += 1
+        for key in _AUDIT_FIELDS:
+            try:
+                sums[key] += int(item.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+
+    recent = data.get("recent")
+    merged: list[Any] = list(samples)
+    if isinstance(recent, list):
+        merged.extend(recent)
+    merged = merged[:_PROMPT_AUDIT_KEEP]
+
+    payload = {
+        "samples": total_samples,
+        "sums": sums,
+        "first_at": float(data.get("first_at") or (samples[0].get("at") or 0.0)),
+        "last_at": float(samples[-1].get("at") or 0.0),
+        "recent": merged,
+    }
+
+    try:
+        await storage_api.save_json(STORE_NAME, PROMPT_AUDIT_KEY, payload)
+        return True
+    except Exception as error:  # noqa: BLE001 - 审计写不进去不影响任何行为
+        logger.warning(f"[context_archiver] 写入提示词归因失败: {error}")
+        return False
+
+
+async def flush_prompt_audit() -> bool:
+    """强制把缓冲里的样本落盘（命令查询前调，保证看到最新数据）。"""
+    pending = list(PromptAuditBuffer.pending)
+    PromptAuditBuffer.pending.clear()
+    PromptAuditBuffer.last_flush_mono = time.monotonic()
+    return await _flush_prompt_audit(pending)
+
+
+async def load_prompt_audit() -> dict[str, Any]:
+    """读取提示词归因的汇总与最近样本。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, PROMPT_AUDIT_KEY)
+    except Exception:  # noqa: BLE001
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 __all__ = [
     "AUDIT_KEY",
     "END_ACTION_NAMES",
     "LOCAL_MEMORY_KEY",
+    "PROMPT_AUDIT_KEY",
     "STORE_NAME",
     "STREAMS_KEY",
     "WAIT_ACTION_NAMES",
     "ArchiveAuditRecord",
     "ArchiveStateStore",
+    "PromptAuditBuffer",
     "StreamState",
     "append_audit",
     "append_local_memories",
+    "flush_prompt_audit",
     "load_audit",
     "load_local_memories",
+    "load_prompt_audit",
+    "record_prompt_audit",
 ]

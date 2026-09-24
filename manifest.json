@@ -28,6 +28,12 @@
       "enabled": true
     },
     {
+      "component_type": "event_handler",
+      "component_name": "prompt_auditor",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
       "component_type": "command",
       "component_name": "archive",
       "dependencies": [],

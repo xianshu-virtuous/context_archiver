@@ -25,7 +25,7 @@ from src.kernel.scheduler import TriggerType, get_unified_scheduler
 from . import archiver
 from .commands import ArchiveCommand
 from .config import ContextArchiverConfig
-from .handlers import ActivityTrackerHandler, ArchiveSummaryInjector
+from .handlers import ActivityTrackerHandler, ArchiveSummaryInjector, PromptAuditorHandler
 from .service import ContextArchiverService
 
 logger = get_logger("context_archiver")
@@ -89,6 +89,7 @@ class ContextArchiverPlugin(BasePlugin):
             ContextArchiverService,
             ActivityTrackerHandler,
             ArchiveSummaryInjector,
+            PromptAuditorHandler,
             ArchiveCommand,
         ]
 
