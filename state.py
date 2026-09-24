@@ -528,23 +528,213 @@ async def load_prompt_audit() -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+# --------------------------------------------------------------------------- #
+# 存储：召回与动作统计
+# --------------------------------------------------------------------------- #
+
+#: 召回统计的存储键。
+RECALL_STATS_KEY = "recall_stats"
+
+#: 动作调用统计的存储键。
+ACTION_STATS_KEY = "action_stats"
+
+
+class RuntimeStats:
+    """召回与动作统计的内存增量。
+
+    记录的是「自上次落盘以来的增量」，落盘时读盘上旧值累加——
+    这样进程重启不会把历史清零，也不必每轮写盘。
+
+    挂**类属性**：框架每次 ``get_service()`` 都新建实例。
+    """
+
+    #: 召回增量：rounds / injected / chars / src:<来源>
+    recall_delta: dict[str, int] = {}
+
+    #: 动作增量：<kind>:<name>
+    action_delta: dict[str, int] = {}
+
+    #: 最近一次落盘的单调时钟读数。
+    last_flush_mono: float = -1.0e9
+
+    #: 落盘间隔（秒）。
+    flush_interval: float = 20.0
+
+
+def _bump(bucket: dict[str, int], key: str, value: int = 1) -> None:
+    """给计数器加一笔。"""
+    bucket[key] = int(bucket.get(key, 0)) + int(value)
+
+
+async def _merge_counters(key: str, delta: dict[str, int]) -> bool:
+    """把增量并进盘上的计数器。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, key)
+    except Exception:  # noqa: BLE001 - 读不到按空处理
+        raw = None
+    data = raw if isinstance(raw, dict) else {}
+    counters = data.get("counters")
+    merged: dict[str, int] = {}
+    if isinstance(counters, dict):
+        for name, value in counters.items():
+            try:
+                merged[str(name)] = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+    for name, value in delta.items():
+        merged[name] = merged.get(name, 0) + int(value)
+    try:
+        await storage_api.save_json(
+            STORE_NAME,
+            key,
+            {"counters": merged, "updated_at": time.time()},
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - 统计写不进去不影响任何行为
+        logger.warning(f"[context_archiver] 写入统计失败（{key}）: {error}")
+        return False
+
+
+async def flush_stats(*, force: bool = False) -> bool:
+    """把统计增量落盘（命令查询前会 force 一次）。
+
+    Args:
+        force: 是否忽略落盘间隔。
+
+    Returns:
+        是否真的写了盘。
+    """
+    stats = RuntimeStats
+    now = time.monotonic()
+    if not force and (now - stats.last_flush_mono) < stats.flush_interval:
+        return False
+
+    recall_delta = dict(stats.recall_delta)
+    action_delta = dict(stats.action_delta)
+    if not recall_delta and not action_delta:
+        stats.last_flush_mono = now
+        return False
+
+    stats.recall_delta.clear()
+    stats.action_delta.clear()
+    stats.last_flush_mono = now
+
+    ok = True
+    if recall_delta:
+        ok = await _merge_counters(RECALL_STATS_KEY, recall_delta) and ok
+    if action_delta:
+        ok = await _merge_counters(ACTION_STATS_KEY, action_delta) and ok
+    return ok
+
+
+async def record_recall(injected: int, chars: int, sources: dict[str, int]) -> None:
+    """记一笔召回统计（内存累加，按需落盘）。
+
+    Args:
+        injected: 本次注入了几条。
+        chars: 注入文本字符数。
+        sources: 各路贡献条数。
+    """
+    stats = RuntimeStats
+    stats.recall_delta["rounds"] = int(stats.recall_delta.get("rounds", 0)) + 1
+    _bump(stats.recall_delta, "injected", int(injected))
+    _bump(stats.recall_delta, "chars", int(chars))
+    for name, value in (sources or {}).items():
+        _bump(stats.recall_delta, f"src:{name}", int(value or 0))
+    await flush_stats()
+
+
+async def record_action(
+    *,
+    name: str,
+    kind: str,
+    stream_id: str = "",
+    success: bool = True,
+    at: float = 0.0,
+) -> None:
+    """记一笔动作/工具调用。
+
+    Args:
+        name: 动作或工具名。
+        kind: ``action`` 或 ``tool``。
+        stream_id: 所属聊天流（仅日志用）。
+        success: 是否成功。
+        at: 调用时刻。
+    """
+    if not name:
+        return
+    stats = RuntimeStats
+    _bump(stats.action_delta, f"{kind}:{name}")
+    if not success:
+        _bump(stats.action_delta, f"{kind}:{name}:failed")
+    await flush_stats()
+
+
+async def load_recall_stats() -> dict[str, int]:
+    """读取召回的累计统计。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, RECALL_STATS_KEY)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    counters = raw.get("counters")
+    if not isinstance(counters, dict):
+        return {}
+    result: dict[str, int] = {}
+    for name, value in counters.items():
+        try:
+            result[str(name)] = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+async def load_action_stats() -> dict[str, int]:
+    """读取动作调用的累计统计。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, ACTION_STATS_KEY)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    counters = raw.get("counters")
+    if not isinstance(counters, dict):
+        return {}
+    result: dict[str, int] = {}
+    for name, value in counters.items():
+        try:
+            result[str(name)] = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 __all__ = [
+    "ACTION_STATS_KEY",
     "AUDIT_KEY",
     "END_ACTION_NAMES",
     "LOCAL_MEMORY_KEY",
     "PROMPT_AUDIT_KEY",
+    "RECALL_STATS_KEY",
     "STORE_NAME",
     "STREAMS_KEY",
     "WAIT_ACTION_NAMES",
     "ArchiveAuditRecord",
     "ArchiveStateStore",
     "PromptAuditBuffer",
+    "RuntimeStats",
     "StreamState",
     "append_audit",
     "append_local_memories",
     "flush_prompt_audit",
+    "flush_stats",
+    "load_action_stats",
     "load_audit",
     "load_local_memories",
     "load_prompt_audit",
+    "load_recall_stats",
+    "record_action",
     "record_prompt_audit",
+    "record_recall",
 ]

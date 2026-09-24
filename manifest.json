@@ -34,6 +34,18 @@
       "enabled": true
     },
     {
+      "component_type": "event_handler",
+      "component_name": "auto_recall_injector",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "action_stats",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
       "component_type": "command",
       "component_name": "archive",
       "dependencies": [],

@@ -112,6 +112,25 @@ class ContextArchiverConfig(BaseConfig):
                 "关闭后只看本流自己的活跃时间。"
             ),
         )
+        turn_trigger_enabled: bool = Field(
+            default=True,
+            description=(
+                "**按轮数触发**：该流累积够 turn_threshold 条消息就归档一次，"
+                "不等话题结束、不等静默。\n"
+                "这是「提高写记忆频率」的主开关——让记忆持续沉淀，Bot 就不必靠长上下文记事。\n"
+                "注意：轮数触发**永远不会清空上下文**（话题还活着，清空会切断对话），"
+                "它只写记忆。"
+            ),
+        )
+        turn_threshold: int = Field(
+            default=12,
+            description=(
+                "累积多少条消息触发一次轮数归档。\n"
+                "调小＝记得更勤、花的模型调用更多；调大＝省调用但记得粗。"
+            ),
+            ge=2,
+            le=500,
+        )
 
     @config_section("archive")
     class ArchiveSection(SectionBase):
@@ -222,6 +241,115 @@ class ContextArchiverConfig(BaseConfig):
             description="有明确对话者时，把记忆挂到该人物（person_id）上，便于按人检索。",
         )
 
+    @config_section("recall")
+    class RecallSection(SectionBase):
+        """读取侧：自动召回（不需要 Bot 主动调 tool 就能记起事情）。
+
+        两条路线，可单选可并用：
+
+        - ``structured``（**默认**）：人物路 + 近因路 + 可选关键词路。
+          全部走 booku 元数据层的 SQL 查询，**零网络、零 embedding、毫秒级**，
+          所以可以直接在 prompt 构建里同步做，不增加首字延迟。
+          代价：不做语义扩展（"饿了" 匹配不到 "没吃饭"）。
+        - ``embedding``：走 ``retrieve_memories``（EPA 向量检索）。
+          能命中语义相近的内容，代价是每轮一次 embedding 网络调用。
+        - ``both``：两路都跑、合并去重。
+
+        两条路线都是**绕过 tool** 的：Bot 不需要调用任何记忆工具，
+        插件在 prompt 构建时直接把该记得的塞进上下文。
+        """
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "是否开启自动召回。\n"
+                "开启后每轮往 user prompt 的 extra 里注入少量记忆（默认 ≤900 字符 ≈ 600 token）。\n"
+                "成本约 0.002 元/轮；而它省掉的一次记忆 tool 调用值 0.035 元/轮——净赚。"
+            ),
+        )
+        mode: str = Field(
+            default="structured",
+            description="召回路线：structured（默认，本地 SQL）/ embedding（向量）/ both（合并）。",
+        )
+        top_k: int = Field(
+            default=3,
+            description="最多注入几条记忆。条数越多越贵，3 条通常够。",
+            ge=1,
+            le=20,
+        )
+        max_chars: int = Field(
+            default=900,
+            description="注入文本的总字符上限（超出按相关度截断）。",
+            ge=100,
+            le=8000,
+        )
+        cooldown_seconds: int = Field(
+            default=600,
+            description=(
+                "同一条记忆在这段时间内不重复注入。\n"
+                "不做冷却的话，同一段事会被每轮重复塞进上下文——纯浪费。"
+            ),
+            ge=0,
+            le=86400,
+        )
+        include_archived: bool = Field(
+            default=True,
+            description="是否检索归档层。默认开：本插件写入的记忆可能被标成 archived。",
+        )
+        person_first: bool = Field(
+            default=True,
+            description="人物路：优先取「关于当前对话者」的记忆（按 person_id 精确匹配）。",
+        )
+        recent_limit: int = Field(
+            default=2,
+            description="近因路：再补几条「最近被激活过的」记忆（不需要关键词，最稳）。",
+            ge=0,
+            le=10,
+        )
+        keyword_enabled: bool = Field(
+            default=False,
+            description=(
+                "关键词路：从最近对话里抠词，走 grep 做字符级匹配。\n"
+                "默认关——中文没有分词，抠词容易出噪音；等人物路+近因路不够用再开。"
+            ),
+        )
+        keyword_limit: int = Field(
+            default=2,
+            description="关键词路最多贡献几条。",
+            ge=0,
+            le=10,
+        )
+        touch_activated: bool = Field(
+            default=True,
+            description=(
+                "召回命中后调用 update_activated 抬高激活计数。\n"
+                "**这是关键一环**：booku 的隐现层会在 7 天内淘汰激活不足的记忆，"
+                "而被召回过的东西本来就该留下——读得越多，记忆越稳。"
+            ),
+        )
+        embedding_top_k: int = Field(
+            default=5,
+            description="embedding 路线先召回多少条候选（再由预算裁剪）。",
+            ge=1,
+            le=50,
+        )
+        timeout_seconds: float = Field(
+            default=3.0,
+            description=(
+                "单次召回的时间上限（秒）。超时就放弃本轮注入，绝不让记忆拖慢对话。\n"
+                "structured 路线是本地 SQL，正常几十毫秒。"
+            ),
+            ge=0.2,
+            le=30.0,
+        )
+        target_prompts: list[str] = Field(
+            default_factory=lambda: [
+                "default_chatter_user_prompt",
+                "neo_default_chatter_user_prompt",
+            ],
+            description="允许注入召回的 user prompt 模板名列表。",
+        )
+
     @config_section("audit")
     class AuditSection(SectionBase):
         """审计与回滚记录配置。"""
@@ -245,6 +373,14 @@ class ContextArchiverConfig(BaseConfig):
                 "只读统计，不改动 prompt，不拦截事件。"
             ),
         )
+        action_stats_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否统计动作/工具的调用次数。\n"
+                "实测一次「对话回合」平均触发 5.56 次 LLM 请求、每多一步多花 0.0350 元，"
+                "所以要省钱就得知道这 5.56 步花在哪些动作上。只读统计。"
+            ),
+        )
 
     @config_section("observer")
     class ObserverSection(SectionBase):
@@ -266,6 +402,7 @@ class ContextArchiverConfig(BaseConfig):
     archive: ArchiveSection = Field(default_factory=ArchiveSection)
     model: ModelSection = Field(default_factory=ModelSection)
     memory: MemorySection = Field(default_factory=MemorySection)
+    recall: RecallSection = Field(default_factory=RecallSection)
     audit: AuditSection = Field(default_factory=AuditSection)
     observer: ObserverSection = Field(default_factory=ObserverSection)
 

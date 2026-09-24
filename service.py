@@ -153,6 +153,58 @@ class ContextArchiverService(BaseService):
             "recent": recent if isinstance(recent, list) else [],
         }
 
+    async def recall_stats(self) -> dict[str, Any]:
+        """自动召回的累计统计（注入多少条、多少字符、各路贡献）。
+
+        Returns:
+            含 ``rounds`` / ``injected`` / ``chars`` / ``sources`` 等字段的字典。
+        """
+        await state_module.flush_stats(force=True)
+        counters = await state_module.load_recall_stats()
+        rounds = int(counters.get("rounds") or 0)
+        injected = int(counters.get("injected") or 0)
+        chars = int(counters.get("chars") or 0)
+        sources = {
+            key[4:]: value for key, value in counters.items() if key.startswith("src:")
+        }
+        return {
+            "enabled": bool(self.config.recall.enabled),
+            "mode": str(self.config.recall.mode or "structured"),
+            "top_k": int(self.config.recall.top_k),
+            "cooldown_seconds": int(self.config.recall.cooldown_seconds),
+            "rounds": rounds,
+            "injected": injected,
+            "chars": chars,
+            "sources": sources,
+            "avg_items_per_round": round(injected / rounds, 2) if rounds else 0.0,
+            "avg_chars_per_round": round(chars / rounds) if rounds else 0,
+        }
+
+    async def action_stats(self) -> dict[str, Any]:
+        """动作与工具的调用次数统计（用于定位 agent 循环的步数构成）。
+
+        Returns:
+            含 ``total`` / ``actions`` / ``tools`` 的字典（按次数倒序）。
+        """
+        await state_module.flush_stats(force=True)
+        counters = await state_module.load_action_stats()
+
+        def _pick(prefix: str) -> dict[str, int]:
+            picked: dict[str, int] = {}
+            for key, value in counters.items():
+                if not key.startswith(prefix) or key.endswith(":failed"):
+                    continue
+                picked[key[len(prefix):]] = int(value)
+            return dict(sorted(picked.items(), key=lambda item: -item[1]))
+
+        actions = _pick("action:")
+        tools = _pick("tool:")
+        return {
+            "total": sum(actions.values()) + sum(tools.values()),
+            "actions": actions,
+            "tools": tools,
+        }
+
     async def archive_now(
         self,
         stream_id: str,

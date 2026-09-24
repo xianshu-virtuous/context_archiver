@@ -38,6 +38,8 @@ TIME_SENSE_SIGNATURE = "time_sense:service:time_sense"
 TRIGGER_END_SIGNAL = "end_signal"
 TRIGGER_IDLE = "idle"
 TRIGGER_MANUAL = "manual"
+#: 按轮数触发：累积够多就沉淀一次，**只写记忆、绝不清空**（话题可能还在继续）。
+TRIGGER_TURNS = "turns"
 
 _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊天记录压缩成两样东西：一份可以长期留存的摘要，以及若干条独立的记忆条目。
 
@@ -360,9 +362,30 @@ def evaluate(
                 reason=f"静默 {int(idle)}s（阈值 {trigger_cfg.idle_seconds}s）",
                 trigger=TRIGGER_IDLE,
             )
+
+    # 轮数触发：话题可能还在继续，但这段该沉淀进记忆了。
+    # 这条是「提高写记忆频率」的主路径，且它**只写记忆、不清空上下文**
+    # —— 话题还活着，清空会切断对话。
+    if trigger_cfg.turn_trigger_enabled and stream_state.pending_count >= int(
+        trigger_cfg.turn_threshold
+    ):
+        return ArchiveDecision(
+            should=True,
+            reason=(
+                f"已累积 {stream_state.pending_count} 条消息"
+                f"（阈值 {trigger_cfg.turn_threshold}）"
+            ),
+            trigger=TRIGGER_TURNS,
+        )
+
+    if last_activity > 0:
+        idle = current - last_activity
         return ArchiveDecision(
             should=False,
-            reason=f"仍然活跃（静默 {int(idle)}s < {trigger_cfg.idle_seconds}s）",
+            reason=(
+                f"仍然活跃（静默 {int(idle)}s < {trigger_cfg.idle_seconds}s，"
+                f"累积 {stream_state.pending_count} 条）"
+            ),
         )
 
     return ArchiveDecision(should=False, reason="没有活跃记录")
@@ -596,8 +619,14 @@ async def archive_stream(
     snapshot.fallback_used = sink_result.fallback_used
 
     # ── 清空：只在记忆落地成功、且没有截断风险时 ────────────────────────────
+    # 轮数触发（话题还活着）一律不清空——那是"沉淀记忆"，不是"结束话题"。
     cleared = False
-    if config.archive.clear_context_enabled and truncated:
+    if config.archive.clear_context_enabled and trigger == TRIGGER_TURNS:
+        if config.plugin.debug_log:
+            logger.info(
+                f"[context_archiver] 轮数触发只写记忆，不清空上下文（{stream_id[:8]}）"
+            )
+    elif config.archive.clear_context_enabled and truncated:
         logger.warning(
             f"[context_archiver] 消息数超过单次上限（{snapshot.message_count} 条），"
             f"为避免推进水位线跳过更早的未归档消息，本次保守跳过清空（{stream_id[:8]}）"
@@ -761,6 +790,7 @@ __all__ = [
     "TRIGGER_END_SIGNAL",
     "TRIGGER_IDLE",
     "TRIGGER_MANUAL",
+    "TRIGGER_TURNS",
     "ArchiveDecision",
     "StreamSnapshot",
     "archive_stream",

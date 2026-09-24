@@ -40,6 +40,8 @@ _HELP = """【上下文归档器】
 /归档 状态           同上
 /归档 审计           最近几次归档记录
 /归档 注入           提示词构成归因（钱花在哪）
+/归档 召回           自动召回统计（记起了多少、成本多少）
+/归档 动作           动作/工具调用分布（agent 步数花在哪）
 /归档 流             当前流的详细状态
 /归档 演练           只总结不落盘（预演）
 /归档 现在           立刻归档当前流
@@ -200,6 +202,70 @@ class ArchiveCommand(BaseCommand):
     async def handle_prompt_audit_en(self) -> tuple[bool, str]:
         """注入归因（英文别名）。"""
         return await self.handle_prompt_audit()
+
+    @cmd_route("召回")
+    async def handle_recall(self) -> tuple[bool, str]:
+        """自动召回统计。"""
+        service = self._get_service()
+        data = await service.recall_stats()
+        avg_chars = int(data.get("avg_chars_per_round") or 0)
+        lines = [
+            f"【自动召回】{'开' if data.get('enabled') else '关'}（路线 {data.get('mode')}）",
+            f"采样 {data.get('rounds', 0)} 轮 ｜ 注入 {data.get('injected', 0)} 条 ｜ "
+            f"{data.get('chars', 0):,} 字符",
+            f"平均每轮 {data.get('avg_items_per_round', 0)} 条 / {avg_chars} 字符"
+            f"（上限 {data.get('top_k', 0)} 条）",
+            f"冷却 {data.get('cooldown_seconds', 0)}s",
+        ]
+        sources = data.get("sources") or {}
+        if sources:
+            detail = "、".join(
+                f"{key} {value}" for key, value in sorted(sources.items(), key=lambda x: -x[1])
+            )
+            lines.append(f"各路候选：{detail}")
+        lines.append("")
+        lines.append("对照：省掉一次记忆 tool 调用 ≈ 0.0350 元/轮；")
+        lines.append(
+            f"注入成本 ≈ {avg_chars / 1.5 * 3.0 / 1e6:.5f} 元/轮（按全价粗估）——净赚。"
+        )
+        await self._reply("\n".join(lines))
+        return True, "recall"
+
+    @cmd_route("recall")
+    async def handle_recall_en(self) -> tuple[bool, str]:
+        """召回统计（英文别名）。"""
+        return await self.handle_recall()
+
+    @cmd_route("动作")
+    async def handle_actions(self) -> tuple[bool, str]:
+        """动作/工具调用分布。"""
+        service = self._get_service()
+        data = await service.action_stats()
+        total = int(data.get("total") or 0)
+        if not total:
+            await self._reply("还没有动作统计——等 bot 跑过几轮再看。")
+            return True, "empty"
+
+        lines = [f"【动作/工具调用统计】合计 {total} 次"]
+        actions = data.get("actions") or {}
+        if actions:
+            lines.append("动作：")
+            for name, count in list(actions.items())[:10]:
+                lines.append(f"  {str(name):<30}{count:>6}")
+        tools = data.get("tools") or {}
+        if tools:
+            lines.append("工具：")
+            for name, count in list(tools.items())[:10]:
+                lines.append(f"  {str(name):<30}{count:>6}")
+        lines.append("")
+        lines.append("每次调用 = 一次 agent 步进 ≈ 0.0350 元。砍调用最多的那几个最划算。")
+        await self._reply("\n".join(lines))
+        return True, "actions"
+
+    @cmd_route("actions")
+    async def handle_actions_en(self) -> tuple[bool, str]:
+        """动作统计（英文别名）。"""
+        return await self.handle_actions()
 
     @cmd_route("流")
     async def handle_stream(self) -> tuple[bool, str]:

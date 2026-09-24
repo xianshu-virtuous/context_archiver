@@ -29,9 +29,13 @@ MODULES = [
     "context_archiver.state",
     "context_archiver.llm",
     "context_archiver.sink",
+    "context_archiver.recall",
     "context_archiver.archiver",
     "context_archiver.service",
     "context_archiver.handlers.activity_tracker",
+    "context_archiver.handlers.prompt_auditor",
+    "context_archiver.handlers.auto_recall",
+    "context_archiver.handlers.action_stats",
     "context_archiver.commands.archive_command",
     "context_archiver.plugin",
 ]
