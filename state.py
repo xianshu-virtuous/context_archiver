@@ -677,6 +677,7 @@ async def record_action(
     stream_id: str = "",
     success: bool = True,
     at: float = 0.0,
+    scope: str = "",
 ) -> None:
     """记一笔动作/工具调用。
 
@@ -686,11 +687,15 @@ async def record_action(
         stream_id: 所属聊天流（仅日志用）。
         success: 是否成功。
         at: 调用时刻。
+        scope: 步进作用域名（只用于诊断，记成 ``scope:<值>``）。
     """
     if not name:
         return
     stats = RuntimeStats
     _bump(stats.action_delta, f"{kind}:{name}")
+    if scope:
+        # 不同的 chatter 用的 scope 名不一样，先记下来，别猜。
+        _bump(stats.action_delta, f"scope:{scope}")
     if not success:
         _bump(stats.action_delta, f"{kind}:{name}:failed")
     await flush_stats()

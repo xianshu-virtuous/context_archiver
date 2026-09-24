@@ -188,6 +188,19 @@ async def _write_booku(
         memory_id = _extract_memory_id(result)
         if memory_id:
             created_ids.append(memory_id)
+            # 写入后立刻把激活计数抬 1。
+            #
+            # 为什么必须做：booku 的检索排序是 ``last_activated_at.desc()``，
+            # 而刚写进去的记忆 activation_count = 0 —— 它永远排不上队、永远召不回来，
+            # 于是 act 永远是 0，7 天后还会被隐现层当"没用的"丢掉。这是个死锁。
+            # 抬 1 之后：召回时再 +1 就到 2，正好够晋升阈值。
+            if config.memory.touch_on_write:
+                try:
+                    await service.update_activated(memory_id)
+                except Exception as error:  # noqa: BLE001 - 抬计数失败不影响写入本身
+                    logger.debug(
+                        f"[context_archiver] 抬激活计数失败（{memory_id[:8]}）: {error}"
+                    )
 
     if created_ids:
         return SinkResult(

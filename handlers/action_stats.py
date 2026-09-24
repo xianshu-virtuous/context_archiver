@@ -96,26 +96,45 @@ class ActionStatsHandler(BaseEventHandler):
         return EventDecision.SUCCESS, params
 
     async def _on_chatter_step(self, params: dict[str, Any]) -> None:
-        """一个 chatter 步结束：把这轮用到的工具全部记一笔。"""
-        step_scope = str(params.get("step_scope") or "").strip()
-        if step_scope and step_scope != _TARGET_SCOPE:
-            return
+        """一个 chatter 步结束：把这轮用到的工具全部记一笔。
 
+        **不按 ``step_scope`` 过滤**：不同 chatter 的 scope 名不一样（实测见过
+        ``actor_round``、也见过空串），限定反而会一条都收不到。
+        改为把 scope 本身记进统计——跑一轮就知道实际有哪些值。
+        """
+        step_scope = str(params.get("step_scope") or "").strip() or "(空)"
         used_tools = params.get("used_tools")
         if not isinstance(used_tools, (list, tuple)):
+            # 没有 used_tools 也记一笔，方便诊断「事件到底有没有来」
+            await state_module.record_action(
+                name="__no_used_tools__",
+                kind="diag",
+                scope=step_scope,
+                at=time.time(),
+            )
             return
 
         stream_id = str(params.get("stream_id") or "")[:16]
         now = time.time()
+        recorded = False
         for raw in used_tools:
             kind, name = _split_call(str(raw))
             if not name:
                 continue
+            recorded = True
             await state_module.record_action(
                 name=name,
                 kind=kind,
                 stream_id=stream_id,
                 success=True,
+                at=now,
+                scope=step_scope,
+            )
+        if not recorded:
+            await state_module.record_action(
+                name="__empty_round__",
+                kind="diag",
+                scope=step_scope,
                 at=now,
             )
 

@@ -254,6 +254,15 @@ class ContextArchiverConfig(BaseConfig):
             default=True,
             description="有明确对话者时，把记忆挂到该人物（person_id）上，便于按人检索。",
         )
+        touch_on_write: bool = Field(
+            default=True,
+            description=(
+                "写入记忆后立刻把激活计数抬 1。\n"
+                "**默认必须开**：booku 的检索按「最近激活」排序，新写的记忆激活数是 0，"
+                "永远排不上队、召不回来，7 天后还会被隐现层当没用的丢掉——这是死锁。\n"
+                "抬 1 之后召回时再 +1 就到 2，正好够晋升阈值。"
+            ),
+        )
 
     @config_section("recall")
     class RecallSection(SectionBase):
