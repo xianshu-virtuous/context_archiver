@@ -39,7 +39,8 @@ _HELP = """【上下文归档器】
 /归档                状态总览
 /归档 状态           同上
 /归档 审计           最近几次归档记录
-/归档 注入           提示词构成归因（钱花在哪）
+/归档 注入           提示词构成归因（模板部分）
+/归档 输入           真实输入构成（工具声明 vs payloads）← 找压缩靶子用
 /归档 召回           自动召回统计（记起了多少、成本多少）
 /归档 动作           动作/工具调用分布（agent 步数花在哪）
 /归档 流             当前流的详细状态
@@ -266,6 +267,54 @@ class ArchiveCommand(BaseCommand):
     async def handle_actions_en(self) -> tuple[bool, str]:
         """动作统计（英文别名）。"""
         return await self.handle_actions()
+
+    @cmd_route("输入")
+    async def handle_input(self) -> tuple[bool, str]:
+        """真实输入构成：工具声明 vs payloads。"""
+        service = self._get_service()
+        data = await service.input_audit()
+        samples = int(data.get("samples") or 0)
+        if not samples:
+            await self._reply("还没有采样——等 bot 跑过几轮 LLM 请求再看。")
+            return True, "empty"
+
+        def tok(chars: float) -> int:
+            """字符数粗估 token（中文约 1 token ≈ 1.5 字符）。"""
+            return int(chars / 1.5)
+
+        tools_chars = int(data.get("avg_tools_chars") or 0)
+        payload_chars = int(data.get("avg_payload_chars") or 0)
+        total_chars = int(data.get("avg_total_chars") or 0) or (tools_chars + payload_chars)
+        lines = [
+            f"【真实输入构成】{samples} 次请求采样",
+            f"  工具声明  {tools_chars:>8,} 字符 ≈ {tok(tools_chars):>7,} tok"
+            f"  （{data.get('avg_tools_count', 0)} 个）← 固定开销",
+            f"  payloads  {payload_chars:>8,} 字符 ≈ {tok(payload_chars):>7,} tok",
+            f"  合计      {total_chars:>8,} 字符 ≈ {tok(total_chars):>7,} tok",
+        ]
+        roles = data.get("roles") or {}
+        if roles:
+            lines.append("")
+            lines.append("payloads 按角色：")
+            for role, chars in roles.items():
+                share = (chars / payload_chars * 100) if payload_chars else 0
+                lines.append(
+                    f"  {str(role):<14}{int(chars):>8,} 字符 ≈ {tok(chars):>7,} tok"
+                    f"  （占 payloads {share:.0f}%）"
+                )
+        lines.append("")
+        lines.append("对照：实测单次请求约 59k token。工具声明占比越大，「按需暴露工具」越值。")
+        if total_chars:
+            lines.append(
+                f"当前：工具声明占单次输入 {tools_chars / total_chars * 100:.0f}%。"
+            )
+        await self._reply("\n".join(lines))
+        return True, "input-audit"
+
+    @cmd_route("input")
+    async def handle_input_en(self) -> tuple[bool, str]:
+        """输入构成（英文别名）。"""
+        return await self.handle_input()
 
     @cmd_route("流")
     async def handle_stream(self) -> tuple[bool, str]:

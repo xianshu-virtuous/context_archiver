@@ -205,6 +205,41 @@ class ContextArchiverService(BaseService):
             "tools": tools,
         }
 
+    async def input_audit(self) -> dict[str, Any]:
+        """真实输入构成统计：工具声明 vs 各角色 payload。
+
+        用来回答「那 41k 的固定开销里，工具声明占多少、砍哪块最值」。
+
+        Returns:
+            含 ``samples`` / ``avg_tools_chars`` / ``avg_payload_chars`` / ``roles`` 的字典。
+        """
+        await state_module.flush_input_audit()
+        data = await state_module.load_input_audit()
+        samples = int(data.get("samples") or 0)
+        raw = data.get("counters")
+        counters: dict[str, Any] = raw if isinstance(raw, dict) else {}
+
+        def _avg(key: str) -> float:
+            try:
+                return round(int(counters.get(key) or 0) / samples) if samples else 0
+            except (TypeError, ValueError):
+                return 0
+
+        roles = {
+            key[len("role:"):]: _avg(key)
+            for key in counters
+            if str(key).startswith("role:")
+        }
+        return {
+            "samples": samples,
+            "avg_tools_count": _avg("tools_count"),
+            "avg_tools_chars": _avg("tools_chars"),
+            "avg_payload_chars": _avg("payload_chars"),
+            "avg_total_chars": _avg("total_chars"),
+            "roles": dict(sorted(roles.items(), key=lambda item: -item[1])),
+            "recent": data.get("recent") if isinstance(data.get("recent"), list) else [],
+        }
+
     async def archive_now(
         self,
         stream_id: str,

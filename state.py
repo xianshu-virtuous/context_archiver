@@ -409,6 +409,9 @@ async def load_local_memories() -> list[dict[str, Any]]:
 #: 提示词归因审计的存储键。
 PROMPT_AUDIT_KEY = "prompt_audit"
 
+#: 真实输入构成统计的存储键（tools + payloads）。
+INPUT_AUDIT_KEY = "input_audit"
+
 #: 归因审计保留的最近样本条数。
 _PROMPT_AUDIT_KEEP = 40
 
@@ -429,6 +432,9 @@ class PromptAuditBuffer:
 
     #: 待落盘的样本。
     pending: list[dict[str, Any]] = []
+
+    #: 待落盘的「真实输入构成」样本（BEFORE_LLM_REQUEST）。
+    input_pending: list[dict[str, Any]] = []
 
     #: 最近一次落盘的单调时钟读数。
     last_flush_mono: float = -1.0e9
@@ -718,10 +724,114 @@ async def load_action_stats() -> dict[str, int]:
     return result
 
 
+async def record_input_audit(record: dict[str, Any]) -> bool:
+    """记一笔「真实输入构成」样本（内存缓冲 + 定期落盘）。
+
+    Args:
+        record: 单次样本，含 tools_chars / tools_count / payload_chars /
+            total_chars / roles（各角色字符数）。
+
+    Returns:
+        本次调用是否触发了落盘。
+    """
+    buffer = PromptAuditBuffer
+    buffer.input_pending.append(record)
+
+    now = time.monotonic()
+    due = (
+        len(buffer.input_pending) >= buffer.flush_size
+        or (now - buffer.last_flush_mono) >= buffer.flush_interval
+    )
+    if not due:
+        return False
+
+    pending = list(buffer.input_pending)
+    buffer.input_pending.clear()
+    buffer.last_flush_mono = now
+    return await _flush_input_audit(pending)
+
+
+async def _flush_input_audit(samples: list[dict[str, Any]]) -> bool:
+    """把输入构成样本并进滚动统计并落盘。"""
+    if not samples:
+        return False
+
+    try:
+        raw = await storage_api.load_json(STORE_NAME, INPUT_AUDIT_KEY)
+    except Exception:  # noqa: BLE001
+        raw = None
+    data = raw if isinstance(raw, dict) else {}
+
+    total = int(data.get("samples") or 0)
+    counters: dict[str, int] = {}
+    raw_counters = data.get("counters")
+    if isinstance(raw_counters, dict):
+        for key, value in raw_counters.items():
+            try:
+                counters[str(key)] = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+
+    for item in samples:
+        total += 1
+        for key, value in item.items():
+            if key in ("at", "request_name", "roles"):
+                continue
+            try:
+                counters[key] = counters.get(key, 0) + int(value)
+            except (TypeError, ValueError):
+                continue
+        roles = item.get("roles")
+        if isinstance(roles, dict):
+            for role, chars in roles.items():
+                try:
+                    mark = f"role:{role}"
+                    counters[mark] = counters.get(mark, 0) + int(chars)
+                except (TypeError, ValueError):
+                    continue
+
+    recent = data.get("recent")
+    merged: list[Any] = list(samples[-10:])
+    if isinstance(recent, list):
+        merged.extend(recent[:10])
+
+    payload = {
+        "samples": total,
+        "counters": counters,
+        "first_at": float(data.get("first_at") or (samples[0].get("at") or 0.0)),
+        "last_at": float(samples[-1].get("at") or 0.0),
+        "recent": merged[:20],
+    }
+    try:
+        await storage_api.save_json(STORE_NAME, INPUT_AUDIT_KEY, payload)
+        return True
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"[context_archiver] 写入输入构成统计失败: {error}")
+        return False
+
+
+async def flush_input_audit() -> bool:
+    """强制把输入构成缓冲落盘。"""
+    pending = list(PromptAuditBuffer.input_pending)
+    PromptAuditBuffer.input_pending.clear()
+    PromptAuditBuffer.last_flush_mono = time.monotonic()
+    return await _flush_input_audit(pending)
+
+
+async def load_input_audit() -> dict[str, Any]:
+    """读取输入构成统计。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, INPUT_AUDIT_KEY)
+    except Exception:  # noqa: BLE001
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 __all__ = [
     "ACTION_STATS_KEY",
     "AUDIT_KEY",
     "END_ACTION_NAMES",
+    "INPUT_AUDIT_KEY",
     "LOCAL_MEMORY_KEY",
     "PROMPT_AUDIT_KEY",
     "RECALL_STATS_KEY",
@@ -735,14 +845,17 @@ __all__ = [
     "StreamState",
     "append_audit",
     "append_local_memories",
+    "flush_input_audit",
     "flush_prompt_audit",
     "flush_stats",
     "load_action_stats",
     "load_audit",
+    "load_input_audit",
     "load_local_memories",
     "load_prompt_audit",
     "load_recall_stats",
     "record_action",
+    "record_input_audit",
     "record_prompt_audit",
     "record_recall",
 ]

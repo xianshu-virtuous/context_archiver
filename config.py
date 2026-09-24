@@ -390,6 +390,21 @@ class ContextArchiverConfig(BaseConfig):
                 "所以要省钱就得知道这 5.56 步花在哪些动作上。只读统计。"
             ),
         )
+        input_audit_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否在 ``BEFORE_LLM_REQUEST`` 上统计**真正的输入构成**。\n"
+                "``ON_PROMPT_BUILD`` 只能看见模板占位符（实测只占单次输入 1.7%），"
+                "完整输入在 payloads + tools 里：单次请求约 59k token，其中约 41k 是"
+                "system prompt 与工具/动作声明。这里把「工具声明」和「各角色 payload」分开数，"
+                "用来定「砍哪一块最值」。框架允许订阅者改 payloads/tools，"
+                "所以这份数据直接对应「能裁多少」。只读，不改。"
+            ),
+        )
+        input_audit_request_names: list[str] = Field(
+            default_factory=lambda: ["default_chatter"],
+            description="只统计这些请求名（避免把总结、判定等旁路调用算进来）。",
+        )
 
     @config_section("observer")
     class ObserverSection(SectionBase):

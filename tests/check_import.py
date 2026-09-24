@@ -36,6 +36,7 @@ MODULES = [
     "context_archiver.handlers.prompt_auditor",
     "context_archiver.handlers.auto_recall",
     "context_archiver.handlers.action_stats",
+    "context_archiver.handlers.input_auditor",
     "context_archiver.commands.archive_command",
     "context_archiver.plugin",
 ]

@@ -30,6 +30,7 @@ from .handlers import (
     ActivityTrackerHandler,
     ArchiveSummaryInjector,
     AutoRecallInjector,
+    InputAuditorHandler,
     PromptAuditorHandler,
 )
 from .service import ContextArchiverService
@@ -98,6 +99,7 @@ class ContextArchiverPlugin(BasePlugin):
             PromptAuditorHandler,
             AutoRecallInjector,
             ActionStatsHandler,
+            InputAuditorHandler,
             ArchiveCommand,
         ]
 
