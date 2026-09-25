@@ -292,7 +292,13 @@ class ContextArchiverConfig(BaseConfig):
         )
         mode: str = Field(
             default="structured",
-            description="召回路线：structured（默认，本地 SQL）/ embedding（向量）/ both（合并）。",
+            description=(
+                "召回路线：\n"
+                "trigger —— 只走触发词路（存算一体：写入时算好的触发词 + 本地包含匹配）；\n"
+                "structured（默认）—— 触发词路 + 人物/近因/关键词路（本地 SQL）；\n"
+                "embedding —— 只走向量路（每轮一次 embedding 网络调用）；\n"
+                "both —— 全都走。"
+            ),
         )
         top_k: int = Field(
             default=3,
@@ -349,6 +355,43 @@ class ContextArchiverConfig(BaseConfig):
                 "**这是关键一环**：booku 的隐现层会在 7 天内淘汰激活不足的记忆，"
                 "而被召回过的东西本来就该留下——读得越多，记忆越稳。"
             ),
+        )
+        trigger_enabled: bool = Field(
+            default=True,
+            description=(
+                "触发词路（存算一体的读半）总开关。\n"
+                "写记忆时让总结模型顺手吐出 3~8 个触发词（同义词/场景/物件），存进本地索引；\n"
+                "之后每轮拿当前对话跟这张表做**字符串包含匹配**——零 LLM、零网络、零 tool。\n"
+                "例：记忆「水壶昨天坏了有点漏电」触发词含「喝水/渴/水壶」，"
+                "用户一句「有点想喝水」就能把那条捞上来。"
+            ),
+        )
+        trigger_limit: int = Field(
+            default=6,
+            description="触发词路最多贡献几条候选（多了会被 top_k 再裁一次，这里只是上限）。",
+            ge=0,
+            le=30,
+        )
+        trigger_risk_bonus: float = Field(
+            default=1.5,
+            description="风险标记为 high（安全/健康/承诺/钱）的记忆加分，让它优先压过闲聊记忆。",
+            ge=0.0,
+            le=10.0,
+        )
+        trigger_person_bonus: float = Field(
+            default=1.0,
+            description="触发词命中且记忆本来就属于当前对话者时加分（群聊里 person 为空，不生效）。",
+            ge=0.0,
+            le=10.0,
+        )
+        trigger_half_life_hours: float = Field(
+            default=72.0,
+            description=(
+                "触发词路的偏好半衰期（小时）：得分 × 0.5 ** (记忆年龄 / 这个值)。\n"
+                "默认 72 小时——新鲜的事更容易被想起来，但旧事不会完全不出现。"
+            ),
+            ge=1.0,
+            le=8760.0,
         )
         embedding_top_k: int = Field(
             default=5,

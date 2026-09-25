@@ -427,6 +427,12 @@ INPUT_AUDIT_KEY = "input_audit"
 #: 最近一次暴露的工具名清单。
 TOOL_NAMES_KEY = "tool_names"
 
+#: 本地记忆索引（存算一体的「存」半：带触发词的记忆目录）。
+MEMORY_INDEX_KEY = "memory_index"
+
+#: 索引最多保留多少条（要有界，否则匹配越来越慢）。
+_MEMORY_INDEX_KEEP = 800
+
 #: 每轮 payload 指纹（用来算「第一个变化出现在第几个 payload」= 缓存友好度）。
 FINGERPRINT_KEY = "fingerprints"
 
@@ -942,6 +948,67 @@ async def load_tool_names() -> list[str]:
     return [str(item) for item in names if str(item).strip()]
 
 
+async def append_memory_index(records: list[dict[str, Any]]) -> bool:
+    """把新写入的记忆登记进本地索引（存算一体的「存」半）。
+
+    每条只留：memory_id、title、一段正文片段、**triggers**、risk、人物/流、
+    写入时间。查询时全靠这几个字段做本地匹配，**不碰 booku、不调 LLM**。
+
+    Args:
+        records: 待登记的记录列表。
+
+    Returns:
+        是否写入成功。
+    """
+    if not records:
+        return False
+
+    try:
+        raw = await storage_api.load_json(STORE_NAME, MEMORY_INDEX_KEY)
+    except Exception:  # noqa: BLE001
+        raw = None
+    data = raw if isinstance(raw, dict) else {}
+    entries = data.get("entries")
+    merged: list[Any] = list(entries) if isinstance(entries, list) else []
+
+    seen = {str(e.get("id")) for e in merged if isinstance(e, dict)}
+    for record in records:
+        memory_id = str(record.get("id") or "")
+        if not memory_id or memory_id in seen:
+            continue
+        merged.append(record)
+        seen.add(memory_id)
+
+    # 只留最近 N 条：索引要有界，否则匹配会越来越慢、文件越来越大
+    if len(merged) > _MEMORY_INDEX_KEEP:
+        merged = merged[-_MEMORY_INDEX_KEEP:]
+
+    try:
+        await storage_api.save_json(
+            STORE_NAME,
+            MEMORY_INDEX_KEY,
+            {"entries": merged, "count": len(merged), "updated_at": time.time()},
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - 索引写不进去不影响记忆本身
+        logger.warning(f"[context_archiver] 写入记忆索引失败: {error}")
+        return False
+
+
+async def load_memory_index() -> list[dict[str, Any]]:
+    """读取本地记忆索引。"""
+    try:
+        raw = await storage_api.load_json(STORE_NAME, MEMORY_INDEX_KEY)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(raw, dict):
+        return []
+    entries = raw.get("entries")
+    if not isinstance(entries, list):
+        return []
+    return [item for item in entries if isinstance(item, dict)]
+
+
 __all__ = [
     "ACTION_STATS_KEY",
     "AUDIT_KEY",
@@ -949,6 +1016,7 @@ __all__ = [
     "FINGERPRINT_KEY",
     "INPUT_AUDIT_KEY",
     "LOCAL_MEMORY_KEY",
+    "MEMORY_INDEX_KEY",
     "PROMPT_AUDIT_KEY",
     "RECALL_STATS_KEY",
     "STORE_NAME",
@@ -963,6 +1031,7 @@ __all__ = [
     "append_audit",
     "append_fingerprints",
     "append_local_memories",
+    "append_memory_index",
     "flush_input_audit",
     "flush_prompt_audit",
     "flush_stats",
@@ -971,6 +1040,7 @@ __all__ = [
     "load_fingerprints",
     "load_input_audit",
     "load_local_memories",
+    "load_memory_index",
     "load_prompt_audit",
     "load_recall_stats",
     "load_tool_names",

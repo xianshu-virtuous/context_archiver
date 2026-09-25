@@ -4,7 +4,21 @@
 agent 循环，一次 0.0350 元，而且模型经常想不起来调。这个模块把它变成系统行为：
 在 prompt 构建时自动把该记得的捞出来塞进上下文，**Bot 一次 tool 都不用调**。
 
-两条路线（``recall.mode``）：
+三条路线（``recall.mode``）：
+
+- ``trigger``（存算一体的读半）：**写入时预计算，读取时纯本地匹配**。
+
+  写记忆的那一刻，总结模型已经知道这条记忆「在什么场景下会被想起来」——
+  于是让它顺手吐出 3~8 个触发词（同义词、场景、物件），落进本地索引
+  （``storage:context_archiver/memory_index``）。之后每轮对话，插件把当前对话文本
+  跟这张倒排表做**字符串包含匹配**：
+
+  - 记忆：水壶昨天就坏了，有点漏电 → 触发词 ``["水壶", "喝水", "渴", "烧水", "漏电"]``
+  - 用户说：好渴啊，有点想喝水 → 命中 ``喝水`` ``渴`` → **水壶那条被捞上来**
+
+  这正是纯向量/纯关键词都做不到的关联：向量只认语义近邻、关键词只认字面，
+  而「渴 → 水壶漏电」这条边是**写的时候就算好的**。查询侧零 LLM、零网络、零 tool，
+  只是一张表加几个 ``in`` 判断，所以可以直接在 prompt 构建里同步跑。
 
 - ``structured``（默认）：**绕过向量、绕过 tool**，全部走 booku 元数据层的 SQL——
 
@@ -27,12 +41,14 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.app.plugin_system.api import service_api
 from src.app.plugin_system.api.log_api import get_logger
 
+from . import state as state_module
 from .config import ContextArchiverConfig
 
 logger = get_logger("context_archiver.recall")
@@ -58,11 +74,13 @@ class RecallCandidate:
     """一条召回候选。
 
     Attributes:
+    属性:
         memory_id: 记忆 id。
         title: 标题。
         content: 正文（可能是 snippet，取到全文后替换）。
-        source: 来自哪条路（person / recent / keyword / embedding）。
+        source: 来自哪条路（trigger / person / recent / keyword / embedding）。
         score: 排序分（越大越优先）。
+        risk: 风险级别（``high`` 时会在注入文本里加醒目前缀）。
     """
 
     memory_id: str = ""
@@ -70,6 +88,7 @@ class RecallCandidate:
     content: str = ""
     source: str = ""
     score: float = 0.0
+    risk: str = "normal"
 
 
 @dataclass
@@ -153,6 +172,16 @@ def extract_keywords(text: str, *, limit: int = 3) -> list[str]:
     # 长的优先，其次去重保序
     ordered = sorted(set(chunks), key=lambda c: (-len(c), c))
     return ordered[: max(1, limit)]
+
+
+def normalize_for_match(text: str) -> str:
+    """把文本压成适合做「包含匹配」的形式（小写、去空白）。
+
+    中文触发词里不会有空格，所以把查询侧的空白全去掉能提高命中率
+    （``"有点 想喝水"`` → ``"有点想喝水"``）；标点保留——触发词里带标点的概率很低，
+    而查询侧的标点不会挡住「触发词是查询子串」这个判断。
+    """
+    return re.sub(r"\s+", "", str(text or "").lower())
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +285,102 @@ async def _recall_keyword(
     return candidates
 
 
+async def _recall_triggers(
+    config: ContextArchiverConfig,
+    query_text: str,
+    *,
+    person_id: str = "",
+) -> list[RecallCandidate]:
+    """触发词路（存算一体的读半）：把当前对话文本跟本地触发词表做包含匹配。
+
+    **零网络、零 LLM、零 tool**——只读一份本地 JSON 索引。所以它就写在
+    prompt 构建的同步路径上，几十微秒级。
+
+    打分（越大越优先，后面会和其它路一起按分裁剪）：
+
+    - 命中的触发词：多字命中每个 +1.5，单字命中每个 +0.5，底分 3.0
+    - 佐证门槛：只有单字命中且不足两个 → 丢弃（一个「水」字不值得惊动一条记忆）
+    - ``risk == "high"``（安全/健康/承诺/钱）：+ ``trigger_risk_bonus``
+    - 人物一致（写这条记忆时记录的 person 就是现在这个人）：+ ``trigger_person_bonus``
+    - 时间衰减：``0.5 ** (小时数 / 半衰期)``，默认半衰期 72 小时
+
+    Args:
+        config: 插件配置。
+        query_text: 当前对话文本（unreads + history 尾部）。
+        person_id: 当前对话者 id（群聊时为空）。
+
+    Returns:
+        候选列表（可能为空）。
+    """
+    trigger_cfg = config.recall
+    limit = int(trigger_cfg.trigger_limit)
+    if limit <= 0:
+        return []
+
+    query = normalize_for_match(query_text)
+    if len(query) < 2:
+        return []
+
+    try:
+        entries = await state_module.load_memory_index()
+    except Exception as error:  # noqa: BLE001 - 索引读不到就当没命中
+        logger.debug(f"[context_archiver] 读本地记忆索引失败: {error}")
+        return []
+
+    now = time.time()
+    half_life_hours = max(1.0, float(trigger_cfg.trigger_half_life_hours))
+    candidates: list[RecallCandidate] = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        memory_id = str(entry.get("id") or "")
+        if not memory_id:
+            continue
+
+        hits_multi = 0
+        hits_single = 0
+        for trigger in entry.get("triggers") or []:
+            word = normalize_for_match(trigger)
+            if not word or word not in query:
+                continue
+            if len(word) >= 2:
+                hits_multi += 1
+            else:
+                # 单字触发词（"渴"、"水"）很有用——「渴」正是把水壶那条牵出来的边。
+                # 但它太泛（"水"能命中一半对话），所以只给低权重，并且要求佐证：
+                # 光靠一个单字命中的记忆不值得被捞上来。
+                hits_single += 1
+        if not hits_multi and hits_single < 2:
+            continue
+
+        score = 3.0 + 1.5 * hits_multi + 0.5 * hits_single
+        risk = str(entry.get("risk") or "normal").strip().lower()
+        if risk == "high":
+            score += float(trigger_cfg.trigger_risk_bonus)
+        if person_id and str(entry.get("person") or "") == person_id:
+            score += float(trigger_cfg.trigger_person_bonus)
+
+        written_at = entry.get("at")
+        if isinstance(written_at, (int, float)) and written_at > 0:
+            age_hours = max(0.0, (now - float(written_at)) / 3600.0)
+            score *= 0.5 ** (age_hours / half_life_hours)
+
+        candidates.append(
+            RecallCandidate(
+                memory_id=memory_id,
+                title=str(entry.get("title") or ""),
+                content=str(entry.get("snippet") or ""),
+                source="trigger",
+                score=score,
+                risk="high" if risk == "high" else "normal",
+            )
+        )
+
+    candidates.sort(key=lambda c: -c.score)
+    return candidates[:limit]
+
+
 async def _recall_embedding(
     service: Any,
     config: ContextArchiverConfig,
@@ -308,7 +433,8 @@ async def _touch_activated(service: Any, memory_ids: list[str]) -> None:
 # --------------------------------------------------------------------------- #
 
 _BLOCK_HEADER = """## 你想起了一些事
-以下是你记忆里与当前对话相关的内容（自动回想，不是让你念出来的台词，别复述原句）："""
+以下是你记忆里与当前对话相关的内容（自动回想，不是让你念出来的台词，别复述原句；
+带 ⚠ 的是安全/健康/承诺/金钱相关的事，该提醒就主动提醒）："""
 
 
 def build_block(candidates: list[RecallCandidate], *, max_chars: int) -> str:
@@ -331,6 +457,9 @@ def build_block(candidates: list[RecallCandidate], *, max_chars: int) -> str:
             continue
         title = (candidate.title or "").strip()
         entry = f"- {title}：{text}" if title else f"- {text}"
+        if candidate.risk == "high":
+            # 安全/健康/承诺/钱这类事，值得让模型明确知道"这条要主动说"。
+            entry = f"- ⚠ {title}：{text}" if title else f"- ⚠ {text}"
         if used + len(entry) > max_chars:
             remaining = max_chars - used
             if remaining < 40:
@@ -379,6 +508,11 @@ async def recall_for_prompt(
 
     async def _run() -> list[RecallCandidate]:
         collected: list[RecallCandidate] = []
+        # 触发词路（存算一体）：本地索引匹配，零网络，所以放在最前面也无所谓开销。
+        if recall_cfg.trigger_enabled and mode in ("trigger", "structured", "both"):
+            trigger_hits = await _recall_triggers(config, query_text, person_id=person_id)
+            sources["trigger"] = len(trigger_hits)
+            collected.extend(trigger_hits)
         if mode in ("structured", "both"):
             if recall_cfg.person_first and person_id:
                 person_hits = await _recall_person(service, config, person_id)
@@ -450,5 +584,6 @@ __all__ = [
     "build_block",
     "extract_keywords",
     "extract_query_text",
+    "normalize_for_match",
     "recall_for_prompt",
 ]

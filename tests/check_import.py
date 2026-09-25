@@ -20,6 +20,13 @@ import os
 import sys
 from pathlib import Path
 
+#: 控制台可能是 GBK，而脚本结尾会打 ✓ ——直接 print 会抛 UnicodeEncodeError
+#: 把自检结果吞掉（断言全过却返回 1）。统一强制 UTF-8。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+except Exception:  # noqa: BLE001 - 老解释器没有 reconfigure 就算了
+    pass
+
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 NEO_ROOT = Path(os.environ.get("NEO_ROOT", r"F:\Neo-MoFox-Aemeath"))
 

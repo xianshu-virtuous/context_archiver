@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,6 +66,12 @@ class MemoryItem:
     person_id: str = ""
     event_start_at: float = 0.0
     event_end_at: float = 0.0
+    #: **存算一体**：写入时就问清楚「什么情况下该想起这条记忆」。
+    #: 这些词不是给向量检索用的，是给本地倒排表用的——
+    #: 对话里只要出现其中一个，这条记忆就被推给主模型，**运行时零 LLM**。
+    triggers: list[str] = field(default_factory=list)
+    #: 重要度提示：high = 跟安全/健康/承诺/金钱有关，值得主动提一句。
+    risk: str = "normal"
 
     def normalized(self, config: ContextArchiverConfig) -> MemoryItem:
         """用配置里的兜底值补齐空字段。
@@ -96,6 +103,13 @@ class MemoryItem:
             person_id=str(self.person_id or "").strip(),
             event_start_at=float(self.event_start_at or 0.0),
             event_end_at=float(self.event_end_at or 0.0),
+            # 触发词去重、去空白、限长（太长会污染倒排表）
+            triggers=list(
+                dict.fromkeys(
+                    str(t).strip()[:16] for t in (self.triggers or []) if str(t).strip()
+                )
+            )[:12],
+            risk="high" if str(self.risk or "").strip().lower() == "high" else "normal",
         )
 
 
@@ -142,6 +156,8 @@ def _extract_memory_id(result: Any) -> str:
 async def _write_booku(
     items: list[MemoryItem],
     config: ContextArchiverConfig,
+    *,
+    stream_id: str = "",
 ) -> SinkResult:
     """写进框架自带 booku_memory。"""
     try:
@@ -154,6 +170,9 @@ async def _write_booku(
 
     created_ids: list[str] = []
     errors: list[str] = []
+    #: 存算一体的「存」半：写进 booku 的同时，把带触发词的目录登记到本地。
+    #: 之后每一轮对话都是拿这份目录做本地匹配，不碰 booku、不调 LLM。
+    index_records: list[dict[str, Any]] = []
     folder_id = str(config.memory.folder_id or "").strip()
     bucket = str(config.memory.bucket or "memory").strip() or "memory"
     status = str(config.memory.status or "active").strip() or "active"
@@ -188,6 +207,18 @@ async def _write_booku(
         memory_id = _extract_memory_id(result)
         if memory_id:
             created_ids.append(memory_id)
+            index_records.append(
+                {
+                    "id": memory_id,
+                    "title": item.title,
+                    "snippet": (item.content or "")[:120],
+                    "triggers": list(item.triggers or []),
+                    "risk": item.risk,
+                    "person": item.person_id,
+                    "stream": stream_id,
+                    "at": time.time(),
+                }
+            )
             # 写入后立刻把激活计数抬 1。
             #
             # 为什么必须做：booku 的检索排序是 ``last_activated_at.desc()``，
@@ -203,6 +234,8 @@ async def _write_booku(
                     )
 
     if created_ids:
+        if index_records:
+            await state_module.append_memory_index(index_records)
         return SinkResult(
             ok=True,
             sink="booku",
@@ -223,8 +256,9 @@ async def _write_local(
     import time as _time
 
     entries: list[dict[str, Any]] = []
+    index_records: list[dict[str, Any]] = []
     now = _time.time()
-    for item in items:
+    for position, item in enumerate(items):
         if not item.content:
             continue
         entries.append(
@@ -243,11 +277,28 @@ async def _write_local(
                 "reason": reason,
             }
         )
+        # 本地兜底也要登记进触发词索引（存算一体的「存」半），否则 booku 一挂，
+        # 写入还在、召回却空了。本地条目没有 booku 的 memory_id，所以自己造一个；
+        # 又因为没有 read_full_content 可补，片段留长一点（500 字符）。
+        index_records.append(
+            {
+                "id": f"local:{int(now * 1000)}-{position}",
+                "title": item.title,
+                "snippet": (item.content or "")[:500],
+                "triggers": list(item.triggers or []),
+                "risk": item.risk,
+                "person": item.person_id,
+                "stream": stream_id,
+                "at": now,
+            }
+        )
 
     if not entries:
         return SinkResult(ok=False, sink="local", error="没有可写入的条目")
 
     written = await state_module.append_local_memories(entries)
+    if written and index_records:
+        await state_module.append_memory_index(index_records)
     return SinkResult(
         ok=written,
         sink="local",
@@ -288,7 +339,7 @@ async def write_memories(
     if sink_name == "local":
         return await _write_local(normalized, stream_id, reason=reason)
 
-    result = await _write_booku(normalized, config)
+    result = await _write_booku(normalized, config, stream_id=stream_id)
     if result.ok:
         return result
 

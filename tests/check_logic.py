@@ -22,15 +22,23 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+#: 控制台默认可能是 GBK，而自检里会出现 ⚠ 这类非 GBK 字符——直接 print 会抛
+#: UnicodeEncodeError 把整个自检带崩。统一强制 UTF-8（换不动的就退化成 replace）。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+except Exception:  # noqa: BLE001 - 老解释器没有 reconfigure 就算了
+    pass
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 NEO_ROOT = Path(os.environ.get("NEO_ROOT", r"F:\Neo-MoFox-Aemeath"))
 sys.path.insert(0, str(NEO_ROOT))
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 
-from context_archiver import archiver, llm, state as st  # noqa: E402
+from context_archiver import archiver, llm, recall as rc, state as st  # noqa: E402
 from context_archiver.config import ContextArchiverConfig  # noqa: E402
 from context_archiver.sink import MemoryItem  # noqa: E402
 
@@ -446,6 +454,158 @@ def test_audit_roundtrip() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 7. 存算一体：触发词路（写入时预计算，读取时本地包含匹配）
+# --------------------------------------------------------------------------- #
+
+
+def test_trigger_route() -> None:
+    """触发词路：那张「水壶 / 渴」的经典例子必须真的能命中。"""
+    section("7. 存算一体（触发词路，零 LLM 查询）")
+
+    # 必须用真实时钟：_recall_triggers 内部按 time.time() 算年龄，写死一个
+    # 过去的常量会让 0.5 ** (小时数/半衰期) 直接下溢成 0 分。
+    now = time.time()
+    index = [
+        {
+            "id": "m-kettle",
+            "title": "水壶坏了",
+            "snippet": "水壶昨天就坏了，有点漏电，先别用",
+            "triggers": ["水壶", "喝水", "渴", "烧水", "漏电"],
+            "risk": "high",
+            "person": "u1",
+            "at": now - 3600.0,
+        },
+        {
+            "id": "m-milk",
+            "title": "买牛奶",
+            "snippet": "主人说想喝牛奶",
+            "triggers": ["牛奶", "早餐"],
+            "risk": "normal",
+            "person": "u1",
+            "at": now - 3600.0 * 48,
+        },
+        {
+            "id": "m-noise",
+            "title": "单字噪音",
+            "snippet": "只有一个单字触发词",
+            "triggers": ["水"],
+            "risk": "normal",
+            "person": "",
+            "at": now,
+        },
+        {
+            "id": "m-two-single",
+            "title": "两个单字",
+            "snippet": "两个单字触发词够成佐证",
+            "triggers": ["水", "喝"],
+            "risk": "normal",
+            "person": "",
+            "at": now,
+        },
+    ]
+
+    real_load = st.load_memory_index
+    real_get_booku = rc._get_booku
+
+    async def fake_load() -> list[dict]:
+        return [dict(item) for item in index]
+
+    class FakeBooku:
+        """只实现召回路径用到的两个方法。"""
+
+        async def read_full_content(self, memory_ids: list[str]) -> dict:
+            return {"items": []}
+
+        async def update_activated(self, memory_id: str) -> None:
+            return None
+
+    st.load_memory_index = fake_load  # type: ignore[assignment]
+
+    async def fake_get_booku():
+        return FakeBooku()
+
+    rc._get_booku = fake_get_booku  # type: ignore[assignment]
+
+    try:
+        check("normalize_for_match 去空白并小写", rc.normalize_for_match(" 好 渴 A ") == "好渴a")
+
+        config = ContextArchiverConfig()
+        config.recall.trigger_limit = 6
+        config.recall.trigger_half_life_hours = 72.0
+        config.recall.cooldown_seconds = 0
+        check("触发词路默认开启", config.recall.trigger_enabled is True)
+
+        query = "好渴啊，有点想喝水"
+        hits = asyncio.run(rc._recall_triggers(config, query, person_id="u1"))
+        ids = [c.memory_id for c in hits]
+        check("「渴 / 喝水」命中水壶那条", "m-kettle" in ids, f"{ids}")
+        check("无关记忆不命中", "m-milk" not in ids, f"{ids}")
+        check("单字触发词被当噪音丢弃", "m-noise" not in ids, f"{ids}")
+        check("两个单字命中算够佐证 → 保留", "m-two-single" in ids, f"{ids}")
+        check(
+            "多字命中排在单字组合之前",
+            ids.index("m-kettle") < ids.index("m-two-single"),
+            f"{ids}",
+        )
+
+        kettle = next(c for c in hits if c.memory_id == "m-kettle")
+        check("候选正文先用索引里的 snippet 占位", bool(kettle.content), kettle.content[:20])
+        check("risk=high 被打上标记", kettle.risk == "high")
+        check(
+            "打分包含 risk/person 加分（>4+1+1.5 衰减后仍 >7）",
+            kettle.score > 7.0,
+            f"{kettle.score:.3f}",
+        )
+
+        no_person = asyncio.run(rc._recall_triggers(config, query, person_id=""))
+        kettle_np = next(c for c in no_person if c.memory_id == "m-kettle")
+        check("人物一致有加分", kettle.score > kettle_np.score, f"{kettle.score:.3f} vs {kettle_np.score:.3f}")
+
+        # 时间衰减：同一条记忆，写的时间越久远分越低
+        old_index = [dict(index[0], at=now - 3600.0 * 24 * 30)]
+        st.load_memory_index = lambda: _async_list(old_index)  # type: ignore[assignment]
+        old_hits = asyncio.run(rc._recall_triggers(config, query, person_id="u1"))
+        check("时间衰减：30 天前的同一条分更低", old_hits[0].score < kettle.score, f"{old_hits[0].score:.3f}")
+        st.load_memory_index = fake_load  # type: ignore[assignment]
+
+        config.recall.trigger_limit = 0
+        check("trigger_limit=0 → 不贡献候选", asyncio.run(rc._recall_triggers(config, query)) == [])
+        config.recall.trigger_limit = 6
+
+        config.recall.trigger_enabled = False
+        outcome_off = asyncio.run(
+            rc.recall_for_prompt(config, {"unreads": query}, person_id="u1")
+        )
+        check("总开关关掉后不注入", outcome_off.block == "" and "trigger" not in outcome_off.sources)
+        config.recall.trigger_enabled = True
+
+        # 端到端：mode=trigger → 组装出可注入文本
+        config.recall.mode = "trigger"
+        config.recall.max_chars = 900
+        outcome = asyncio.run(rc.recall_for_prompt(config, {"unreads": query}, person_id="u1"))
+        check("mode=trigger 时确实注入了内容", bool(outcome.block), f"error={outcome.error}")
+        check("注入内容带上了水壶这条", "水壶" in outcome.block, outcome.block[:80])
+        check("高风险记忆带 ⚠ 前缀", "⚠" in outcome.block, outcome.block[:80])
+        check("sources 记录了 trigger 路", outcome.sources.get("trigger", 0) >= 1, f"{outcome.sources}")
+        check("injected_ids 可用于写冷却", "m-kettle" in outcome.injected_ids, f"{outcome.injected_ids}")
+
+        # mode=structured 也应包含触发词路（本地零成本）
+        config.recall.mode = "structured"
+        config.recall.recent_limit = 0
+        config.recall.person_first = False
+        outcome2 = asyncio.run(rc.recall_for_prompt(config, {"unreads": query}, person_id="u1"))
+        check("mode=structured 也走触发词路", "水壶" in outcome2.block, outcome2.block[:80])
+    finally:
+        st.load_memory_index = real_load  # type: ignore[assignment]
+        rc._get_booku = real_get_booku  # type: ignore[assignment]
+
+
+async def _async_list(items: list[dict]) -> list[dict]:
+    """把一个列表包成 async 函数（给假的 load_memory_index 用）。"""
+    return items
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -459,6 +619,7 @@ def main() -> int:
     test_build_digest()
     test_evaluate_edges()
     test_audit_roundtrip()
+    test_trigger_route()
 
     section("结果")
     print(f"共 {checks} 项断言，失败 {len(failures)} 项")

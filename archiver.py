@@ -59,6 +59,11 @@ _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊�
    这些比"聊了聊近况"有用得多。信息密度要高，不要为了凑字数注水。
 8. 宁可少写一条，也不要让 JSON 被截断——被截断的输出等于什么都没总结。
    （这一条比第 7 条更重要：写满但完整，胜过多写一条却被截断。）
+9. **每条记忆必须给 `triggers`**：写明「什么情况下该想起这条」。3~8 个中文词或短语，
+   要覆盖三样东西——**同义说法、相关场景、相关物品**。
+   例如「水壶昨天坏了，有点漏电」这条，triggers 应含：`喝水 渴 烧水 用水 用电 危险 安全`。
+   这样对方哪怕只说一句「有点渴」，这条也能被想起来——这正是你写 triggers 的目的。
+   另外给 `risk`：`high` 表示这条跟**安全 / 健康 / 承诺 / 金钱**有关、值得主动提一句；其余用 `normal`。
 
 输出格式：
 {
@@ -71,7 +76,9 @@ _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊�
       "memory_type": "event",
       "core_tags": ["标签1"],
       "diffusion_tags": ["标签2", "标签3"],
-      "opposing_tags": ["标签4"]
+      "opposing_tags": ["标签4"],
+      "triggers": ["喝水", "渴", "烧水", "用电", "危险"],
+      "risk": "high"
     }
   ]
 }
@@ -534,6 +541,12 @@ def _parse_summary_payload(
                     opposing_tags=[
                         str(x) for x in (entry.get("opposing_tags") or []) if str(x).strip()
                     ],
+                    # 存算一体的产物：触发词由写入时的模型产出（那时它有上下文、有常识），
+                    # 之后查询只做本地字符串匹配 —— 运行时一次 LLM 都不用调。
+                    triggers=[
+                        str(x) for x in (entry.get("triggers") or []) if str(x).strip()
+                    ],
+                    risk=str(entry.get("risk") or "normal"),
                 )
             )
 
