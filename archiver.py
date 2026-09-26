@@ -340,6 +340,57 @@ def build_digest(messages: list[Any], *, max_chars: int) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _backoff_seconds(streak: int, config: ContextArchiverConfig) -> float:
+    """算第 ``streak`` 次连续失败后该退避多久（秒）。
+
+    指数增长：base × 2^(streak-1)，封顶 ``retry_backoff_max_seconds``。
+    ``retry_backoff_seconds = 0`` 表示关闭退避（返回 0）。
+    """
+    base = float(getattr(config.archive, "retry_backoff_seconds", 0) or 0)
+    if streak <= 0 or base <= 0:
+        return 0.0
+    cap = float(getattr(config.archive, "retry_backoff_max_seconds", 0) or 0)
+    if cap < base:
+        cap = base
+    # 指数不能直接算到爆：先按次数钳一下，避免 2**400 这种
+    exponent = min(int(streak) - 1, 20)
+    return min(cap, base * (2**exponent))
+
+
+async def _mark_failure(
+    stream_state: state_module.StreamState,
+    config: ContextArchiverConfig,
+    *,
+    stream_id: str,
+    error: str,
+) -> None:
+    """记一次归档失败并落盘。
+
+    为什么必须落盘：失败不推进水位线（消息不会丢），但下一个 tick 会**立刻**重试。
+    实测某个流因此连续失败 406 次、每次都是一次真实的模型调用，一条记忆都没写出来。
+    把「连续失败次数 + 失败时刻」存下来，``evaluate`` 才能据此退避。
+    """
+    stream_state.fail_streak = int(stream_state.fail_streak or 0) + 1
+    stream_state.last_fail_at = time.time()
+
+    warn_after = max(1, int(getattr(config.archive, "retry_warn_after", 3) or 3))
+    streak = stream_state.fail_streak
+    if streak >= warn_after and (streak == warn_after or streak % warn_after == 0):
+        wait = _backoff_seconds(streak, config)
+        logger.warning(
+            f"[context_archiver] 归档连续失败 {streak} 次"
+            f"（stream={stream_id[:8]}），退避 {int(wait)}s 后再试。"
+            f"最后一次错误：{error}"
+        )
+
+    try:
+        states = await state_module.ArchiveStateStore.load_all()
+        states[stream_id] = stream_state
+        await state_module.ArchiveStateStore.save_all(states, force=True)
+    except Exception as exc:  # noqa: BLE001 - 记不下来只影响退避，不影响主流程
+        logger.debug(f"[context_archiver] 记录失败状态时出错（{stream_id[:8]}）: {exc}")
+
+
 def evaluate(
     stream_state: state_module.StreamState,
     config: ContextArchiverConfig,
@@ -358,6 +409,22 @@ def evaluate(
     """
     current = float(now if now is not None else time.time())
     trigger_cfg = config.trigger
+
+    # 失败退避放在最前面：结束信号/静默都拦不住「每 15 秒重试一次」，
+    # 只有退避能拦。它只影响重试节奏，不会让消息被跳过。
+    streak = int(stream_state.fail_streak or 0)
+    last_fail = float(stream_state.last_fail_at or 0.0)
+    if streak > 0 and last_fail > 0:
+        wait = _backoff_seconds(streak, config)
+        waited = current - last_fail
+        if wait > 0 and waited < wait:
+            return ArchiveDecision(
+                should=False,
+                reason=(
+                    f"上次归档失败（连续 {streak} 次），退避中："
+                    f"还需 {int(wait - waited)}s（退避 {int(wait)}s）"
+                ),
+            )
 
     if stream_state.pending_count < int(trigger_cfg.min_messages):
         return ArchiveDecision(
@@ -602,6 +669,9 @@ async def archive_stream(
     digest = build_digest(messages, max_chars=int(config.archive.max_digest_chars))
     if not digest:
         snapshot.error = "消息正文为空，无法总结"
+        await _mark_failure(
+            stream_state, config, stream_id=stream_id, error=snapshot.error
+        )
         await _write_audit(config, snapshot, summary="")
         return snapshot
 
@@ -630,6 +700,9 @@ async def archive_stream(
     )
     if not result.ok:
         snapshot.error = f"总结调用失败: {result.error}"
+        await _mark_failure(
+            stream_state, config, stream_id=stream_id, error=snapshot.error
+        )
         await _write_audit(config, snapshot, summary="")
         return snapshot
 
@@ -644,6 +717,9 @@ async def archive_stream(
             f"[context_archiver] 总结输出解析失败，水位线不推进"
             f"（stream={stream_id[:8]}，输出 {len(result.text)} 字符）"
             f"原文预览：{preview}"
+        )
+        await _mark_failure(
+            stream_state, config, stream_id=stream_id, error=snapshot.error
         )
         await _write_audit(config, snapshot, summary="")
         return snapshot
@@ -727,6 +803,9 @@ async def archive_stream(
     stream_state.archive_count = int(stream_state.archive_count or 0) + 1
     stream_state.pending_count = 0
     stream_state.last_settled_signal_at = float(stream_state.end_signal_at or 0.0)
+    # 成功就清空失败计数：退避只在「一直失败」时起作用，别让历史失败拖累正常节奏。
+    stream_state.fail_streak = 0
+    stream_state.last_fail_at = 0.0
 
     states = await state_module.ArchiveStateStore.load_all()
     states[stream_id] = stream_state
@@ -856,7 +935,25 @@ async def tick(config: ContextArchiverConfig, *, now: float | None = None) -> li
             }
         )
 
-    await state_module.ArchiveStateStore.save_all(states)
+    # 收尾：把「本 tick 自己改过的观测字段」合并进**盘上最新**的状态再落盘。
+    #
+    # **绝不能直接 save_all(states)**：这里的 states 是循环开始时 load_all(fresh=True)
+    # 拿到的那份快照，而 archive_stream 内部又自己 fresh 取了一份**不同的对象**——
+    # 归档成功后的水位线/archived_ids/summary、失败后的退避计数，全都写在那一份上。
+    # 用陈旧快照回写会把它们全部抹掉（实测靠 save_all 的 3 秒节流侥幸没出事：
+    # 归档成功后立刻回写会被节流拦住；一旦归档耗时超过 3 秒，就真的覆盖了
+    # → 同一批消息被反复总结、反复写记忆，而且失败退避永远不生效）。
+    latest = await state_module.ArchiveStateStore.load_all(fresh=True)
+    for stream_id, state_in_tick in states.items():
+        target = latest.get(stream_id)
+        if target is None:
+            continue
+        # 本 tick 唯一会改的、且归档链路不碰的字段：observer 日志节流时间。
+        target.last_observer_log_at = max(
+            float(target.last_observer_log_at or 0.0),
+            float(state_in_tick.last_observer_log_at or 0.0),
+        )
+    await state_module.ArchiveStateStore.save_all(latest)
     return actions
 
 

@@ -73,6 +73,10 @@ class StreamState:
         summary_updated_at: 摘要最近更新时间。
         last_observer_log_at: observer 模式最近一次打日志的时间（防刷屏）。
         last_settled_signal_at: 已经归档过的那个结束信号时刻，避免重复触发。
+        fail_streak: **连续失败次数**。失败不推进水位线（消息不会丢），但下一个 tick
+            又会立刻重试——实测某个流因此连续失败 406 次、每次都是一次真实的模型调用。
+            所以失败要退避，这个计数就是退避的指数。
+        last_fail_at: 最近一次失败时刻（退避的起点）。
     """
 
     stream_id: str = ""
@@ -90,6 +94,8 @@ class StreamState:
     summary_updated_at: float = 0.0
     last_observer_log_at: float = 0.0
     last_settled_signal_at: float = 0.0
+    fail_streak: int = 0
+    last_fail_at: float = 0.0
     archived_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -130,6 +136,8 @@ class StreamState:
             summary_updated_at=_num("summary_updated_at"),
             last_observer_log_at=_num("last_observer_log_at"),
             last_settled_signal_at=_num("last_settled_signal_at"),
+            fail_streak=_int("fail_streak"),
+            last_fail_at=_num("last_fail_at"),
             archived_ids=[
                 str(item)
                 for item in (data.get("archived_ids") or [])

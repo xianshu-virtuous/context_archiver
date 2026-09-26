@@ -173,6 +173,34 @@ class ContextArchiverConfig(BaseConfig):
             ge=1000,
             le=200000,
         )
+        retry_backoff_seconds: int = Field(
+            default=60,
+            description=(
+                "**失败退避**：一次归档失败后，这个流至少等多少秒才重试。\n"
+                "失败不推进水位线（消息不会丢），但下一个 tick 会立刻重试——巡检间隔默认 15s，"
+                "等于每 15 秒烧一次模型调用。实测某个流因此连续失败 **406 次**、"
+                "一条记忆都没写出来，钱全花在重试上。\n"
+                "退避按指数增长：60 → 120 → 240 → 480…（上限看 retry_backoff_max_seconds）。\n"
+                "填 0 关闭退避（恢复「每个 tick 都试」的旧行为，不建议）。"
+            ),
+            ge=0,
+            le=3600,
+        )
+        retry_backoff_max_seconds: int = Field(
+            default=1800,
+            description="退避的上限（秒）。默认 1800 ＝最慢每 30 分钟试一次。",
+            ge=0,
+            le=86400,
+        )
+        retry_warn_after: int = Field(
+            default=3,
+            description=(
+                "连续失败达到几次时打一条 WARNING 日志（带最后一次的错误原因）。\n"
+                "INFO 级的『巡检动作』很容易被刷过去，这条是给人看的告警。"
+            ),
+            ge=1,
+            le=100,
+        )
 
     @config_section("model")
     class ModelSection(SectionBase):

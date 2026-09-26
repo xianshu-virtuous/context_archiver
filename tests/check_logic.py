@@ -606,6 +606,125 @@ async def _async_list(items: list[dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# 8. 失败退避（不许每 15 秒重试一次烧钱）
+# --------------------------------------------------------------------------- #
+
+
+class _FakeStorage:
+    """假的 storage_api：只记在内存里，够验证「失败计数真的落盘了」。"""
+
+    def __init__(self) -> None:
+        self.data: dict[tuple[str, str], object] = {}
+
+    async def load_json(self, store_name: str, key: str):  # noqa: ANN201
+        return self.data.get((store_name, key))
+
+    async def save_json(self, store_name: str, key: str, value):  # noqa: ANN001, ANN201
+        self.data[(store_name, key)] = value
+        return True
+
+
+def test_retry_backoff() -> None:
+    """失败必须退避，而且失败计数要真的落盘（否则退避无从生效）。"""
+    section("8. 失败退避（连续失败不再每 tick 重试）")
+
+    config = ContextArchiverConfig()
+    config.trigger.idle_seconds = 300
+    config.trigger.min_messages = 20
+    config.archive.retry_backoff_seconds = 60
+    config.archive.retry_backoff_max_seconds = 1800
+
+    curve = {n: archiver._backoff_seconds(n, config) for n in (0, 1, 2, 3, 5, 6, 20)}
+    check("1 次失败退避 60s", curve[1] == 60.0, f"{curve[1]}")
+    check("2 次失败退避 120s", curve[2] == 120.0, f"{curve[2]}")
+    check("3 次失败退避 240s", curve[3] == 240.0, f"{curve[3]}")
+    check("5 次失败退避 960s", curve[5] == 960.0, f"{curve[5]}")
+    check("封顶 1800s（6 次）", curve[6] == 1800.0, f"{curve[6]}")
+    check("封顶后不再涨（20 次）", curve[20] == 1800.0, f"{curve[20]}")
+    check("0 次失败不退避", curve[0] == 0.0, f"{curve[0]}")
+
+    off = ContextArchiverConfig()
+    off.archive.retry_backoff_seconds = 0
+    check("retry_backoff_seconds=0 时关闭退避", archiver._backoff_seconds(5, off) == 0.0)
+
+    tiny = ContextArchiverConfig()
+    tiny.archive.retry_backoff_seconds = 120
+    tiny.archive.retry_backoff_max_seconds = 30
+    check(
+        "上限小于基数时按基数兜底（不会算成 0 或负数）",
+        archiver._backoff_seconds(3, tiny) == 120.0,
+        f"{archiver._backoff_seconds(3, tiny)}",
+    )
+
+    # 失败计数真的落盘吗（走真实 state 存取路径 + 假 storage）
+    real_storage = st.storage_api
+    st.storage_api = _FakeStorage()  # type: ignore[assignment]
+    try:
+        st.ArchiveStateStore.invalidate()
+
+        state = st.StreamState(stream_id="s1", pending_count=31)
+        asyncio.run(st.ArchiveStateStore.save_all({"s1": state}, force=True))
+
+        asyncio.run(
+            archiver._mark_failure(
+                state, config, stream_id="s1", error="总结调用失败: empty response"
+            )
+        )
+        after_one = asyncio.run(st.ArchiveStateStore.get("s1", fresh=True))
+        # 先把读数取出来再制造第二次失败：_mark_failure 是就地修改传入对象的，
+        # 直接把 after_one 传进去会让它自己也变成 2（第一次写这测试就踩了）。
+        one_streak = after_one.fail_streak
+        one_fail_at = after_one.last_fail_at
+
+        asyncio.run(
+            archiver._mark_failure(
+                after_one, config, stream_id="s1", error="模型输出不是合法 JSON"
+            )
+        )
+        after_two = asyncio.run(st.ArchiveStateStore.get("s1", fresh=True))
+
+        check("第一次失败后 fail_streak=1 已落盘", one_streak == 1, f"{one_streak}")
+        check("第二次失败后 fail_streak=2 已落盘", after_two.fail_streak == 2, f"{after_two.fail_streak}")
+        check("last_fail_at 被记录", one_fail_at > 0)
+
+        # 正常情况下「Bot 停了 500s」就是该归档，但退避期内必须压住
+        now = time.time()
+        after_one.last_engagement_at = now - 500.0
+        after_two.last_engagement_at = now - 500.0
+        reasons = [
+            archiver.evaluate(item, config, now=now).reason
+            for item in (after_one, after_two)
+        ]
+        check("退避期内判定为「不归档」", all("退避" in r for r in reasons), f"{reasons}")
+        check("退避秒数按失败次数增长（2 次＝120s）", "120s" in reasons[1], reasons[1])
+
+        # 退避到期后恢复正常判定
+        expired = st.StreamState(
+            stream_id="s2",
+            pending_count=31,
+            last_engagement_at=now - 500.0,
+            fail_streak=1,
+            last_fail_at=now - 61.0,
+        )
+        decision = archiver.evaluate(expired, config, now=now)
+        check("退避期满后照常归档", decision.should is True, decision.reason)
+
+        off.archive.retry_backoff_seconds = 0
+        retry_now = archiver.evaluate(expired, off, now=now)
+        check("关闭退避后立刻重试", retry_now.should is True, retry_now.reason)
+
+        restored = st.StreamState.from_dict(after_two.to_dict())
+        check(
+            "fail_streak / last_fail_at 能往返",
+            restored.fail_streak == 2 and restored.last_fail_at == after_two.last_fail_at,
+            f"{restored.fail_streak} / {restored.last_fail_at}",
+        )
+    finally:
+        st.storage_api = real_storage  # type: ignore[assignment]
+        st.ArchiveStateStore.invalidate()
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -620,6 +739,7 @@ def main() -> int:
     test_evaluate_edges()
     test_audit_roundtrip()
     test_trigger_route()
+    test_retry_backoff()
 
     section("结果")
     print(f"共 {checks} 项断言，失败 {len(failures)} 项")
