@@ -777,6 +777,11 @@ async def archive_stream(
     elif config.archive.clear_context_enabled:
         if sink_result.ok:
             try:
+                # 注意：框架保证这个接口**始终返回 True**（底层 clear_stream_context
+                # 也是），所以 `cleared` 表达的是「调用没抛异常」，不是「确实清掉了多少」。
+                # 真正的效果有两层：清掉内存里的 history/unread，并把
+                # ChatStreams.context_cleared_at 写成当前时间 —— 重启后加载消息只取该
+                # 时间点之后的，所以清空是持久的（已核对框架实现，不是推测）。
                 cleared = bool(await stream_api.load_and_clear_context(stream_id))
             except Exception as error:  # noqa: BLE001 - 清空失败不影响已写入的记忆
                 logger.warning(f"[context_archiver] 清空上下文失败（{stream_id[:8]}）: {error}")

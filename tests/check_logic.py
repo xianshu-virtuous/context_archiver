@@ -13,8 +13,10 @@ r"""逻辑自检：不依赖框架运行时，把「最容易悄悄出错」的�
 
 用法（实例 venv）：
 
-    $env:NEO_ROOT="F:\Neo-MoFox-Aemeath"
-    & "F:\Neo-MoFox-Aemeath\.venv\Scripts\python.exe" tests\check_logic.py
+    $env:NEO_ROOT="<你的 Neo-MoFox 框架根目录>"
+    & "<框架根>\.venv\Scripts\python.exe" plugins\context_archiver\tests\check_logic.py
+
+不设 `NEO_ROOT` 时会自动从「插件装在 `<框架根>\plugins\<插件>`」这个位置倒推两级。
 """
 
 from __future__ import annotations
@@ -34,7 +36,9 @@ except Exception:  # noqa: BLE001 - 老解释器没有 reconfigure 就算了
     pass
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
-NEO_ROOT = Path(os.environ.get("NEO_ROOT", r"F:\Neo-MoFox-Aemeath"))
+#: 框架根：优先用环境变量；装进实例时（``<根>/plugins/<插件>``）可以倒推两级。
+_ENV_ROOT = os.environ.get("NEO_ROOT", "").strip()
+NEO_ROOT = Path(_ENV_ROOT) if _ENV_ROOT else PLUGIN_DIR.parent.parent
 sys.path.insert(0, str(NEO_ROOT))
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 

@@ -172,7 +172,7 @@ user prompt 的 `extra`（默认 ≤900 字符，约 600 token）。
 先放几天，看日志里「**将归档**」出现的时机对不对：
 
 ```
-[context_archiver][observer] stream=4c96dd6a **将归档**：Bot 已 42s 没参与（阈值 30s）
+[context_archiver][observer] stream=3f9a1c2e **将归档**：Bot 已 42s 没参与（阈值 30s）
 ```
 
 **第二步：看看它打算总结什么。**

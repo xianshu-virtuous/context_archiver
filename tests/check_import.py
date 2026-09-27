@@ -3,8 +3,10 @@ r"""真实导入冒烟：证明「框架能加载这个插件」，而不只是�
 
 用法（用实例自带 venv，别用系统 python）：
 
-    $env:NEO_ROOT="F:\Neo-MoFox-Aemeath"
-    & "F:\Neo-MoFox-Aemeath\.venv\Scripts\python.exe" tests\check_import.py
+    $env:NEO_ROOT="<你的 Neo-MoFox 框架根目录>"
+    & "<框架根>\.venv\Scripts\python.exe" plugins\context_archiver\tests\check_import.py
+
+不设 `NEO_ROOT` 时会自动从「插件装在 `<框架根>\plugins\<插件>`」这个位置倒推两级。
 
 它做三件事：
 1. 把框架根目录与插件父目录插进 sys.path，逐个 import 本插件模块；
@@ -28,7 +30,9 @@ except Exception:  # noqa: BLE001 - 老解释器没有 reconfigure 就算了
     pass
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
-NEO_ROOT = Path(os.environ.get("NEO_ROOT", r"F:\Neo-MoFox-Aemeath"))
+#: 框架根：优先用环境变量；装进实例时（``<根>/plugins/<插件>``）可以倒推两级。
+_ENV_ROOT = os.environ.get("NEO_ROOT", "").strip()
+NEO_ROOT = Path(_ENV_ROOT) if _ENV_ROOT else PLUGIN_DIR.parent.parent
 
 MODULES = [
     "context_archiver",
