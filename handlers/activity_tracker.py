@@ -27,9 +27,13 @@ from .. import state as state_module
 
 logger = get_logger("context_archiver.tracker")
 
-#: 摘要注入的目标模板名（两个 chatter 都兼容，只会有实际启用的那个命中）。
+#: 摘要注入的目标模板名（三个 chatter 都兼容，只会有实际启用的那个命中）。
 _TARGET_PROMPTS: frozenset[str] = frozenset(
-    {"default_chatter_user_prompt", "neo_default_chatter_user_prompt"}
+    {
+        "default_chatter_user_prompt",
+        "neo_default_chatter_user_prompt",
+        "kfc_user_prompt",
+    }
 )
 
 #: 注入块的标题与边界说明。写清「这是背景不是台词」，降低被整句搬走的概率。

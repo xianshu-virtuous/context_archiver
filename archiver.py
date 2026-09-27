@@ -497,16 +497,52 @@ def evaluate(
     return ArchiveDecision(should=False, reason="没有活跃记录")
 
 
-async def global_quiet_ok(config: ContextArchiverConfig) -> tuple[bool, str]:
-    """用 time_sense 交叉验证「全局是否也安静」。
+def _time_sense_capabilities(service: object) -> dict[str, Any] | None:
+    """取 time_sense 的能力清单（用于区分 v1 / v2）。
 
-    time_sense 的「距上次说话」是**全局**的：任意一个流有人说话，它就会被刷新。
-    所以本流静默 + 全局活跃 = 别处正在聊天，此时归档容易误判（人家只是切了个窗口）。
+    ``capabilities()`` 是 time_sense 2.0 才有的方法；拿不到就说明对面是老版本，
+    调用方退回旧口径，绝不去猜它的方法签名。
 
-    time_sense 不存在、或其未启用时，直接放行（降级）。
+    Args:
+        service: time_sense 服务实例。
+
+    Returns:
+        能力清单字典；老版本或调用失败时返回 ``None``。
+    """
+    caps_fn = getattr(service, "capabilities", None)
+    if not callable(caps_fn):
+        return None
+    try:
+        caps = caps_fn()
+    except Exception:  # noqa: BLE001 - 探测失败按老版本处理
+        return None
+    return caps if isinstance(caps, dict) else None
+
+
+async def global_quiet_ok(
+    config: ContextArchiverConfig,
+    *,
+    stream_id: str = "",
+) -> tuple[bool, str]:
+    """交叉验证「别处是不是也在聊」——决定这一轮该不该归档。
+
+    **语义**：本流已经满足归档条件了，这里只用来排除「人家只是切了个窗口」——
+    别的流正热闹时归档容易误判，把没结束的对话总结掉。
+
+    **口径演进**：time_sense 1.x 只有**全局**的「距上次说话」——任意一个流有人
+    说话它就被刷新，于是「别的流在聊」和「这个流在聊」分不开。time_sense 2.0 起
+    提供按流时钟（``since_last_message(stream_id=...)``）与流清单
+    (``streams_overview()``)，所以这里改成：
+
+    1. 先看**本流**自己的静默（够安静才继续）；
+    2. 再看**除本流以外**最近的活跃流有没有超过阈值——这才是「别处」的真实含义。
+
+    老版本 time_sense（无 ``capabilities()``）自动退回原来的全局口径；
+    time_sense 不存在、未启用或查询失败时一律放行（降级，绝不因外部插件挡住归档）。
 
     Args:
         config: 插件配置。
+        stream_id: 当前正在判断的聊天流；给了才能做按流校验。
 
     Returns:
         ``(是否放行, 原因文案)``。
@@ -523,6 +559,45 @@ async def global_quiet_ok(config: ContextArchiverConfig) -> tuple[bool, str]:
     if service is None:
         return True, "没有 time_sense"
 
+    seconds_threshold = float(trigger_cfg.idle_seconds)
+    capabilities = _time_sense_capabilities(service)
+
+    if capabilities is not None and stream_id:
+        try:
+            own = await service.since_last_message(stream_id=stream_id)
+            overview = await service.streams_overview(limit=50)
+        except TypeError:  # 对面其实是老版本（不支持这些参数）→ 退回全局口径
+            own = None
+            overview = None
+        except Exception as error:  # noqa: BLE001 - 查询失败按降级处理
+            return True, f"time_sense 按流查询失败（{error}）"
+
+        if isinstance(own, dict) and isinstance(overview, list):
+            own_seconds = float(own.get("seconds") or 0.0)
+            if own.get("has_record") and own_seconds < seconds_threshold:
+                return False, (
+                    f"本流 {int(own_seconds)}s 前还有人说话"
+                    f"（阈值 {int(seconds_threshold)}s）"
+                )
+
+            foreign: list[tuple[float, str]] = []
+            for row in overview:
+                if not isinstance(row, dict):
+                    continue
+                other_id = str(row.get("stream_id") or "")
+                if not other_id or other_id == str(stream_id):
+                    continue
+                silence = float(row.get("silence_seconds") or 0.0)
+                if silence < seconds_threshold:
+                    foreign.append((silence, other_id))
+            if foreign:
+                silence, other_id = min(foreign)
+                return False, (
+                    f"别处仍在活动（{other_id[:8]} {int(silence)}s 前说话，"
+                    f"阈值 {int(seconds_threshold)}s）"
+                )
+            return True, f"按流校验通过：本流与其它流都安静超过 {int(seconds_threshold)}s"
+
     try:
         since = await service.since_last_message()
     except Exception as error:  # noqa: BLE001
@@ -533,9 +608,10 @@ async def global_quiet_ok(config: ContextArchiverConfig) -> tuple[bool, str]:
 
     seconds = float(since.get("seconds") or 0.0)
     threshold = float(trigger_cfg.idle_seconds)
+    scope = "全局（time_sense 老版本口径）" if capabilities is None else "全局"
     if seconds >= threshold:
-        return True, f"全局静默 {int(seconds)}s"
-    return False, f"全局仍有活动（{int(seconds)}s 前有人说话）"
+        return True, f"{scope}静默 {int(seconds)}s"
+    return False, f"{scope}仍有活动（{int(seconds)}s 前有人说话）"
 
 
 # --------------------------------------------------------------------------- #
@@ -914,7 +990,7 @@ async def tick(config: ContextArchiverConfig, *, now: float | None = None) -> li
         # 否则 require_global_quiet 会永远把它挡死（聊天时全局从来不静默，
         # 实测 pending 涨到 169 却一次都没归档，就是因为这个）。
         if decision.trigger != TRIGGER_TURNS:
-            quiet_ok, quiet_reason = await global_quiet_ok(config)
+            quiet_ok, quiet_reason = await global_quiet_ok(config, stream_id=stream_id)
             if not quiet_ok:
                 if config.plugin.debug_log:
                     logger.info(

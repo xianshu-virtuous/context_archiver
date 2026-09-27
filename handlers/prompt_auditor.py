@@ -26,7 +26,11 @@ logger = get_logger("context_archiver.prompt_auditor")
 
 #: 审计的目标模板（与摘要注入器保持一致，只会有实际启用的那个命中）。
 _TARGET_PROMPTS: frozenset[str] = frozenset(
-    {"default_chatter_user_prompt", "neo_default_chatter_user_prompt"}
+    {
+        "default_chatter_user_prompt",
+        "neo_default_chatter_user_prompt",
+        "kfc_user_prompt",
+    }
 )
 
 #: 需要单独统计的占位符。其余键合并计入 ``other``。

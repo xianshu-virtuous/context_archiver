@@ -104,8 +104,10 @@ class ContextArchiverConfig(BaseConfig):
         use_time_sense: bool = Field(
             default=True,
             description=(
-                "检测到 time_sense 时，用它的「距上次说话」交叉验证。\n"
-                "time_sense 不存在时自动降级，本项无副作用。"
+                "检测到 time_sense 时，用它的时间事实交叉验证。\n"
+                "time_sense 2.0 起能按流查「这个流安静了多久」并能列出各流状态，"
+                "本插件会自动用它；老版本（1.x）只有全局口径，同样能跑，"
+                "只是「别处」与「本流」分不开。time_sense 不存在时自动降级，本项无副作用。"
             ),
         )
         require_global_quiet: bool = Field(
@@ -115,7 +117,9 @@ class ContextArchiverConfig(BaseConfig):
                 "判定必须**按流独立进行**：只要这个流里有人发消息，它就是活跃的——\n"
                 "不管那句话说给谁听、Bot 有没有参与。群里大家自顾自聊天时这个流是活跃的，"
                 "当然不该归档；等这个流安静下来就该归档，**与别的流在不在聊无关**。\n"
-                "打开它会造成「A 群在聊 → B 群安静了也写不了」，一般不需要。"
+                "打开它会造成「A 群在聊 → B 群安静了也写不了」，一般不需要。\n"
+                "打开后的判定：time_sense 2.0 在位时按流核对（本流静默 + 其它流都静默），"
+                "老版本则退回全局时间戳（任意流说话都会刷新它）。"
             ),
         )
         turn_trigger_enabled: bool = Field(
@@ -440,8 +444,13 @@ class ContextArchiverConfig(BaseConfig):
             default_factory=lambda: [
                 "default_chatter_user_prompt",
                 "neo_default_chatter_user_prompt",
+                "kfc_user_prompt",
             ],
-            description="允许注入召回的 user prompt 模板名列表。",
+            description=(
+                "允许注入召回的 user prompt 模板名列表。\n"
+                "默认覆盖 default_chatter、neo_default_chatter 与 kokoro_flow_chatter"
+                "（NFC 借前者的注入点，因此同样命中）。"
+            ),
         )
 
     @config_section("audit")

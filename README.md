@@ -94,6 +94,24 @@ Bot 的记忆有两个老毛病：
 只能靠运行时探测：取得到 `time_sense:service:time_sense` 就用它交叉验证，
 取不到就退回纯「Bot 停口」判定，功能不受影响。
 
+用到的是什么：**「别处是不是也在聊」**——本流已经满足归档条件了，若别的流正热闹，
+说明人家只是切了个窗口，这时候总结容易把没结束的对话截断。判定分三种情形：
+
+| 对面的 time_sense | 判定口径 | 说明 |
+| --- | --- | --- |
+| 2.0（有 `capabilities()`） | **按流**：先看本流是否真的静默，再看**除本流以外**最近的活跃流 | 「本流在聊」与「别处在聊」是两条不同的判据，这才是 `require_global_quiet` 想说的意思 |
+| 1.x（无 `capabilities()`） | 退回**全局**「距上次说话」 | 任意流说话都会刷新它，分不开「哪边在聊」；文案里会标注是老版本口径 |
+| 没有 / 查询失败 | 一律**放行** | 外部插件绝不挡住归档——降级路径优先于精确性 |
+
+`require_global_quiet` 默认仍是 `false`（按流独立判定才是对的，见该键说明），
+所以上面这条链路默认根本不执行、零开销。要跨流互斥时才打开。
+
+目标模板名单（本插件注入摘要 / 召回的位置）与 time_sense 的注入名单保持一致：
+`default_chatter_user_prompt`、`neo_default_chatter_user_prompt`、`kfc_user_prompt`
+——覆盖 default_chatter、neo_default_chatter（含借其注入点的 NFC）与 kokoro_flow_chatter。
+
+这条链路的全部边界都有断言守着：`tests/check_time_sense_adapter.py`。
+
 ---
 
 ## 存算一体：为什么关联要写在「写」的时候
@@ -242,7 +260,7 @@ clear_context_enabled = true
 | `idle_seconds` | `30` | **Bot 停口**多久算这一轮过去了（写记忆的主阈值） |
 | `min_messages` | `4` | 少于这么多条不折腾（短寒暄不值得一次模型调用） |
 | `max_messages` | `400` | 单次最多取多少条消息 |
-| `use_time_sense` | `true` | 有 time_sense 就交叉验证 |
+| `use_time_sense` | `true` | 有 time_sense 就交叉验证（2.0 按流判、1.x 退回全局） |
 | `require_global_quiet` | `false` | 是否要求「别的流也安静」才归档。**默认关**：判定按流独立进行 |
 | `turn_trigger_enabled` | `true` | 条数触发（与静默是「或」的关系） |
 | `turn_threshold` | `100` | 累积多少条触发一次（只写记忆，不清空） |
