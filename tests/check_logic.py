@@ -729,6 +729,239 @@ def test_retry_backoff() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 9. 隐私密度分层（私聊内容不外流的那道闸）
+# --------------------------------------------------------------------------- #
+
+
+def test_privacy_tiers() -> None:
+    """9. 隐私密度分层：方向矩阵、外流版替换、默认值。
+
+    这块最容易悄悄坏掉的是**顺序**：来源回填 → 方向拦 → 换外流版 → 取全文之后
+    还得**再换一次**。少任何一步的后果都是「完整正文出去了却没人发现」，
+    所以端到端那条用例故意让 read_full_content 返回完整正文来卡这个点。
+    """
+    section("9. 隐私密度分层（来源回填 → 方向过滤 → 跨流换外流版）")
+
+    config = ContextArchiverConfig()
+
+    # ── 默认值（主人 2026-10-08 拍板：默认开 + allow）──────────────────
+    check("privacy.enabled 默认开", config.privacy.enabled is True)
+    check("apply_to 默认只做私聊", list(config.privacy.apply_to) == ["private"])
+    check(
+        "private_to_group 默认关（这就是那道闸）",
+        config.recall_scope.private_to_group is False,
+    )
+    check("group_to_private 默认放行", config.recall_scope.group_to_private is True)
+    check("group_to_group 默认关（防串群）", config.recall_scope.group_to_group is False)
+    check(
+        "unknown_source 默认 allow（旧记忆不失效）",
+        str(config.recall_scope.unknown_source).strip().lower() == "allow",
+    )
+
+    # ── 分层判定：只对命中的流做，判不出来就不做 ────────────────────────
+    check("私聊 → 分层", archiver.should_tier(config, "private") is True)
+    check("群聊 → 不分层", archiver.should_tier(config, "group") is False)
+    check(
+        "chat_type 拿不到 → 不分层（后续按 gist_missing=drop 兜底）",
+        archiver.should_tier(config, "") is False,
+    )
+    config.privacy.enabled = False
+    check("总开关关掉 → 不分层", archiver.should_tier(config, "private") is False)
+    config.privacy.enabled = True
+
+    # ── 模型输出解析：gist 拿得到，没给就是空串（不瞎编）───────────────
+    payload = {
+        "summary": "摘要",
+        "topic_ended": True,
+        "memories": [
+            {
+                "title": "一起吃了饭",
+                "content": "和主人在楼下吃了火锅，聊了他最近在忙的项目。",
+                "gist": "和对方一起吃了饭，气氛轻松。",
+                "memory_type": "event",
+                "core_tags": ["归档"],
+                "diffusion_tags": ["日常", "吃饭"],
+                "opposing_tags": ["临时"],
+                "triggers": ["吃饭", "火锅"],
+                "risk": "normal",
+            },
+            {"title": "没给外流版", "content": "只有完整正文。", "memory_type": "event"},
+        ],
+    }
+    _summary, items, _ended = archiver._parse_summary_payload(payload, fallback_summary="")
+    check("gist 被解析出来", items[0].gist == "和对方一起吃了饭，气氛轻松。", items[0].gist)
+    check("没给 gist 的条目是空串（不瞎编）", items[1].gist == "", repr(items[1].gist))
+    check(
+        "gist 能通过 normalized 保下来",
+        items[0].normalized(config).gist == items[0].gist,
+    )
+
+    # ── 方向矩阵 ───────────────────────────────────────────────────────
+    scope = config.recall_scope
+
+    def cand(source_type: str, source_stream: str, gist: str = "") -> rc.RecallCandidate:
+        return rc.RecallCandidate(
+            memory_id="m1",
+            title="标题",
+            content="完整正文",
+            source_type=source_type,
+            source_stream=source_stream,
+            gist=gist,
+        )
+
+    def allows(candidate: rc.RecallCandidate, current_stream: str, current_type: str) -> bool:
+        return rc.scope_allows(
+            candidate,
+            current_stream=current_stream,
+            current_type=current_type,
+            scope=scope,
+        )
+
+    check("私聊 → 自己那条私聊：放行", allows(cand("private", "s1"), "s1", "private") is True)
+    check("私聊 → 另一条私聊：恒关", allows(cand("private", "s1"), "s2", "private") is False)
+    check("私聊 → 群聊：默认关", allows(cand("private", "s1"), "g1", "group") is False)
+    check("群聊 → 私聊：默认放行", allows(cand("group", "g1"), "s1", "private") is True)
+    check("群聊 → 同一个群：放行", allows(cand("group", "g1"), "g1", "group") is True)
+    check("群聊 → 别的群：默认关", allows(cand("group", "g1"), "g2", "group") is False)
+    check("老记忆（无来源）默认放行", allows(cand("", ""), "g1", "group") is True)
+
+    scope.private_to_group = True
+    check("private_to_group=true 时放行", allows(cand("private", "s1"), "g1", "group") is True)
+    scope.private_to_group = False
+
+    scope.unknown_source = "deny"
+    check("unknown_source=deny 时老记忆被拦", allows(cand("", ""), "g1", "group") is False)
+    scope.unknown_source = "allow"
+
+    # ── 跨流判定 ───────────────────────────────────────────────────────
+    check(
+        "同流不算跨流",
+        rc.is_cross_stream(cand("private", "s1"), current_stream="s1", current_type="private")
+        is False,
+    )
+    check(
+        "私聊 → 群聊算跨流",
+        rc.is_cross_stream(cand("private", "s1"), current_stream="g1", current_type="group")
+        is True,
+    )
+
+    # ── 端到端：跨流注入的必须是外流版，正文一个字都不出去 ──────────────
+    full_text = "水壶漏电了，主人说回头修。"
+    gist_text = "和对方聊到过一件家里的事，气氛平常。"
+    index = [
+        {
+            "id": "m-kettle",
+            "title": "水壶",
+            "snippet": full_text,
+            "triggers": ["水", "水壶", "渴"],
+            "risk": "normal",
+            "person": "",
+            "stream": "private-s1",
+            "at": time.time(),
+            "gist": gist_text,
+            "source_type": "private",
+        }
+    ]
+    current_index = {"rows": index}
+
+    real_load = st.load_memory_index
+    real_get_booku = rc._get_booku
+
+    async def fake_load() -> list[dict]:
+        return [dict(row) for row in current_index["rows"]]
+
+    class FakeBooku:
+        """故意让 read_full_content 返回完整正文。
+
+        用来卡住「取全文之后必须再换回外流版」这一步：
+        少了它，前面的脱敏会被这句覆盖掉，而单测之外几乎看不出来。
+        """
+
+        async def read_full_content(self, memory_ids: list[str]) -> dict:
+            return {"items": [{"id": mid, "content": full_text} for mid in memory_ids]}
+
+        async def update_activated(self, memory_id: str) -> None:
+            return None
+
+    async def fake_get_booku():
+        return FakeBooku()
+
+    st.load_memory_index = fake_load  # type: ignore[assignment]
+    rc._get_booku = fake_get_booku  # type: ignore[assignment]
+
+    try:
+        config.recall.mode = "trigger"
+        config.recall.trigger_enabled = True
+        config.recall.trigger_limit = 6
+        config.recall.cooldown_seconds = 0
+        config.recall.person_first = False
+        config.recall.recent_limit = 0
+        query = {"unreads": "好渴啊，有点想喝水"}
+
+        blocked = asyncio.run(
+            rc.recall_for_prompt(config, query, stream_id="group-g1", chat_type="group")
+        )
+        check(
+            "默认闸门：私聊记忆不进群聊",
+            full_text not in blocked.block and gist_text not in blocked.block,
+            blocked.block[:100],
+        )
+
+        scope.private_to_group = True
+        crossed = asyncio.run(
+            rc.recall_for_prompt(config, query, stream_id="group-g1", chat_type="group")
+        )
+        check("打开闸门后注入的是外流版", gist_text in crossed.block, crossed.block[:140])
+        check("完整正文没有跟着出去", "漏电" not in crossed.block, crossed.block[:140])
+        scope.private_to_group = False
+
+        same = asyncio.run(
+            rc.recall_for_prompt(config, query, stream_id="private-s1", chat_type="private")
+        )
+        check("同流召回仍是完整正文", "漏电" in same.block, same.block[:140])
+
+        current_index["rows"] = [dict(index[0], gist="")]
+        scope.private_to_group = True
+        missing = asyncio.run(
+            rc.recall_for_prompt(config, query, stream_id="group-g1", chat_type="group")
+        )
+        check(
+            "缺外流版时默认 drop（不注入完整正文）",
+            "漏电" not in missing.block,
+            missing.block[:140],
+        )
+
+        config.privacy.gist_missing = "raw"
+        raw = asyncio.run(
+            rc.recall_for_prompt(config, query, stream_id="group-g1", chat_type="group")
+        )
+        check(
+            "gist_missing=raw 时才退回完整正文（不建议但可配）",
+            "漏电" in raw.block,
+            raw.block[:140],
+        )
+        config.privacy.gist_missing = "drop"
+        scope.private_to_group = False
+        current_index["rows"] = index
+
+        config.privacy.enabled = False
+        legacy = asyncio.run(
+            rc.recall_for_prompt(config, query, stream_id="group-g1", chat_type="group")
+        )
+        check(
+            "关掉 privacy.enabled 后回到 1.1.x 行为（正文照旧跨流）",
+            "漏电" in legacy.block,
+            f"row_snippet={current_index['rows'][0]['snippet'][:24]!r} "
+            f"row_gist={current_index['rows'][0]['gist'][:24]!r} "
+            f"block={legacy.block[-60:]!r}",
+        )
+        config.privacy.enabled = True
+    finally:
+        st.load_memory_index = real_load  # type: ignore[assignment]
+        rc._get_booku = real_get_booku  # type: ignore[assignment]
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -744,6 +977,7 @@ def main() -> int:
     test_audit_roundtrip()
     test_trigger_route()
     test_retry_backoff()
+    test_privacy_tiers()
 
     section("结果")
     print(f"共 {checks} 项断言，失败 {len(failures)} 项")

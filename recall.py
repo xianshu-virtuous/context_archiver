@@ -81,6 +81,9 @@ class RecallCandidate:
         source: 来自哪条路（trigger / person / recent / keyword / embedding）。
         score: 排序分（越大越优先）。
         risk: 风险级别（``high`` 时会在注入文本里加醒目前缀）。
+        source_type: 来源流类型（private / group / discuss）；空串 = 未知来源。
+        source_stream: 来源流 id；判断「同不同流」用它。
+        gist: 隐私密度分层的「外流版」正文；跨流注入时用它代替 ``content``。
     """
 
     memory_id: str = ""
@@ -89,6 +92,9 @@ class RecallCandidate:
     source: str = ""
     score: float = 0.0
     risk: str = "normal"
+    source_type: str = ""
+    source_stream: str = ""
+    gist: str = ""
 
 
 @dataclass
@@ -374,6 +380,10 @@ async def _recall_triggers(
                 source="trigger",
                 score=score,
                 risk="high" if risk == "high" else "normal",
+                # 触发词路本来就直读本地索引，来源与外部版这里现成，不用回查。
+                source_type=str(entry.get("source_type") or "").strip().lower(),
+                source_stream=str(entry.get("stream") or ""),
+                gist=str(entry.get("gist") or ""),
             )
         )
 
@@ -476,12 +486,128 @@ def build_block(candidates: list[RecallCandidate], *, max_chars: int) -> str:
 _BLOCK_HEADER_TEXT = _BLOCK_HEADER
 
 
+# --------------------------------------------------------------------------- #
+# 隐私密度分层：来源回填 → 方向过滤 → 跨流换外流版
+# --------------------------------------------------------------------------- #
+
+
+async def attach_scope_info(candidates: list[RecallCandidate]) -> None:
+    """用本地记忆索引，给每个候选补上「来源流类型 / 来源流 id / 外流版」。
+
+    为什么必须查本地索引、而不是问 booku：
+    booku 的记忆检索是**全局**的，条目里没有「这条是从哪个流写下来的」这个概念，
+    而这件事只有插件自己知道——所以写入时记进 ``memory_index``，召回时按 id 查表回填。
+    查表是纯本地操作，零网络、零模型。
+
+    Args:
+        candidates: 待回填的候选（原地修改）。
+    """
+    if not candidates:
+        return
+    try:
+        entries = await state_module.load_memory_index()
+    except Exception as error:  # noqa: BLE001 - 读不到就当没有来源信息
+        logger.debug(f"[context_archiver] 读本地记忆索引失败（来源回填跳过）: {error}")
+        return
+
+    mapping: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            entry_id = str(entry.get("id") or "")
+            if entry_id:
+                mapping[entry_id] = entry
+
+    for candidate in candidates:
+        entry = mapping.get(candidate.memory_id)
+        if entry is None:
+            continue
+        candidate.source_type = str(entry.get("source_type") or "").strip().lower()
+        candidate.source_stream = str(entry.get("stream") or "")
+        candidate.gist = str(entry.get("gist") or "")
+
+
+def is_cross_stream(
+    candidate: RecallCandidate,
+    *,
+    current_stream: str,
+    current_type: str,
+) -> bool:
+    """这条记忆是不是要「跨流」注入（即离开它自己的来源流）。
+
+    拿不准就返回 ``False``——同流注入没有隐私问题，不该因为保守而误伤。
+
+    Args:
+        candidate: 候选。
+        current_stream: 当前流 id。
+        current_type: 当前流类型。
+
+    Returns:
+        是否需要按跨流处理。
+    """
+    source_stream = str(candidate.source_stream or "")
+    if not source_stream:
+        # 没有来源流信息（旧记忆）：只有当前流类型跟来源类型不一致时才算跨流。
+        source_type = str(candidate.source_type or "").strip().lower()
+        current = str(current_type or "").strip().lower()
+        return bool(source_type and current and source_type != current)
+    return source_stream != str(current_stream or "")
+
+
+def scope_allows(
+    candidate: RecallCandidate,
+    *,
+    current_stream: str,
+    current_type: str,
+    scope: Any,
+) -> bool:
+    """方向矩阵：这条记忆允不允许出现在当前流。
+
+    纯函数——只看配置与来源，**不调模型、不做语义判断**。
+    这正是它跟 ``cross_stream_relay`` 的 relay 机制的区别：
+    那边是让模型自己决定「要不要过去说」，这里是配置决定。
+
+    Args:
+        candidate: 候选。
+        current_stream: 当前流 id。
+        current_type: 当前流类型。
+        scope: ``config.recall_scope``。
+
+    Returns:
+        是否放行。
+    """
+    source = str(candidate.source_type or "").strip().lower()
+    current = str(current_type or "").strip().lower()
+
+    if not source:
+        # 未知来源（1.2.0 之前写入的旧记忆）：默认 allow，不因升级而失效。
+        return (
+            str(getattr(scope, "unknown_source", "allow") or "allow").strip().lower()
+            != "deny"
+        )
+
+    group_like = ("group", "discuss")
+    same_stream = str(candidate.source_stream or "") == str(current_stream or "")
+
+    if source == "private" and current == "private":
+        # 私聊之间只认自己那一条——`private_to_group` 管不到这里，恒关。
+        return same_stream
+    if source == "private" and current in group_like:
+        return bool(getattr(scope, "private_to_group", False))
+    if source in group_like and current == "private":
+        return bool(getattr(scope, "group_to_private", True))
+    if source in group_like and current in group_like:
+        return True if same_stream else bool(getattr(scope, "group_to_group", False))
+    return True
+
+
 async def recall_for_prompt(
     config: ContextArchiverConfig,
     values: dict[str, Any],
     *,
     exclude_ids: set[str] | None = None,
     person_id: str = "",
+    stream_id: str = "",
+    chat_type: str = "",
 ) -> RecallOutcome:
     """执行一次召回并组装注入文本。
 
@@ -497,6 +623,10 @@ async def recall_for_prompt(
     recall_cfg = config.recall
     if not recall_cfg.enabled:
         return RecallOutcome(error="未启用")
+
+    # 当前流信息：优先用调用方传进来的，没有就退回 values 里的 stream_id。
+    current_stream = str(stream_id or values.get("stream_id") or "").strip()
+    current_type = str(chat_type or "").strip().lower()
 
     service = await _get_booku()
     if service is None:
@@ -540,6 +670,49 @@ async def recall_for_prompt(
     except Exception as error:  # noqa: BLE001 - 召回失败绝不影响对话
         return RecallOutcome(error=f"{type(error).__name__}: {error}", sources=sources)
 
+    # ── 隐私密度分层：回填来源 → 按方向拦 → 跨流换外流版 ──────────────────
+    # 拦在汇聚点而不是各路内部：五条路（trigger / person / recent / keyword /
+    # embedding）只有汇合之处是唯一的，放这里不会漏掉任何一条路。
+    if config.privacy.enabled and candidates:
+        await attach_scope_info(candidates)
+        scope = config.recall_scope
+        gist_missing = str(config.privacy.gist_missing or "drop").strip().lower()
+        filtered: list[RecallCandidate] = []
+        dropped = 0
+        for candidate in candidates:
+            if not scope_allows(
+                candidate,
+                current_stream=current_stream,
+                current_type=current_type,
+                scope=scope,
+            ):
+                dropped += 1
+                continue
+            if is_cross_stream(
+                candidate,
+                current_stream=current_stream,
+                current_type=current_type,
+            ):
+                # 跨流：换成外流版。没有外流版就按 gist_missing 处理——
+                # 默认 drop：宁可这次少想起一条，也不让完整正文离开它的来源流。
+                if candidate.gist:
+                    candidate.content = candidate.gist
+                elif gist_missing == "raw":
+                    logger.warning(
+                        f"[context_archiver] 记忆 {candidate.memory_id[:8]} 缺外流版，"
+                        f"按 gist_missing=raw 原样跨流注入（不建议）"
+                    )
+                else:
+                    dropped += 1
+                    continue
+            filtered.append(candidate)
+        candidates = filtered
+        if dropped and config.plugin.debug_log:
+            logger.info(
+                f"[context_archiver] 隐私分层拦截 {dropped} 条"
+                f"（当前流 {current_type or '?'}，stream={current_stream[:8]}）"
+            )
+
     # 去重（同 id 保留分最高的一条）
     blocked = exclude_ids or set()
     best: dict[str, RecallCandidate] = {}
@@ -560,6 +733,16 @@ async def recall_for_prompt(
         full = contents.get(candidate.memory_id)
         if full:
             candidate.content = full
+        # 取全文会把内容换成完整正文 —— 跨流的那几条必须**再换回外流版**，
+        # 否则就成了「先脱敏、后又被还原」，前面的拦截全白做。
+        # 注意这个 `config.privacy.enabled` 守卫：关掉总开关时行为必须**完全**回到
+        # 1.1.x（正文照旧跨流），不能因为候选恰好带着 gist 就偷偷脱敏。
+        if config.privacy.enabled and candidate.gist and is_cross_stream(
+            candidate,
+            current_stream=current_stream,
+            current_type=current_type,
+        ):
+            candidate.content = candidate.gist
 
     block = build_block(ordered, max_chars=int(recall_cfg.max_chars))
     if not block:
@@ -581,9 +764,12 @@ __all__ = [
     "BOOKU_SIGNATURE",
     "RecallCandidate",
     "RecallOutcome",
+    "attach_scope_info",
     "build_block",
     "extract_keywords",
     "extract_query_text",
+    "is_cross_stream",
     "normalize_for_match",
     "recall_for_prompt",
+    "scope_allows",
 ]

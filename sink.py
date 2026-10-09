@@ -72,6 +72,9 @@ class MemoryItem:
     triggers: list[str] = field(default_factory=list)
     #: 重要度提示：high = 跟安全/健康/承诺/金钱有关，值得主动提一句。
     risk: str = "normal"
+    #: 隐私密度分层的「外流版」：跨流召回时用这一份代替 content。
+    #: 空串表示这条没有外流版，跨流时按 ``privacy.gist_missing`` 处理。
+    gist: str = ""
 
     def normalized(self, config: ContextArchiverConfig) -> MemoryItem:
         """用配置里的兜底值补齐空字段。
@@ -110,6 +113,7 @@ class MemoryItem:
                 )
             )[:12],
             risk="high" if str(self.risk or "").strip().lower() == "high" else "normal",
+            gist=str(self.gist or "").strip(),
         )
 
 
@@ -158,6 +162,7 @@ async def _write_booku(
     config: ContextArchiverConfig,
     *,
     stream_id: str = "",
+    source_stream_type: str = "",
 ) -> SinkResult:
     """写进框架自带 booku_memory。"""
     try:
@@ -217,6 +222,12 @@ async def _write_booku(
                     "person": item.person_id,
                     "stream": stream_id,
                     "at": time.time(),
+                    # ── 隐私密度分层 ──────────────────────────────────────────
+                    # gist：这条记忆的「外流版」正文；跨流召回时用它代替全文。
+                    # source_type：来源流类型（private / group），召回侧按它判方向。
+                    # 两者都由写入时一次算好，读侧只做本地查表，零额外模型调用。
+                    "gist": item.gist,
+                    "source_type": source_stream_type,
                 }
             )
             # 写入后立刻把激活计数抬 1。
@@ -251,6 +262,7 @@ async def _write_local(
     stream_id: str,
     *,
     reason: str = "",
+    source_stream_type: str = "",
 ) -> SinkResult:
     """写进本插件自己的 json（booku 不可用时的兜底）。"""
     import time as _time
@@ -275,6 +287,9 @@ async def _write_local(
                 "event_start_at": item.event_start_at,
                 "event_end_at": item.event_end_at,
                 "reason": reason,
+                # 隐私密度分层：外流版与来源类型一并落盘（本地兜底也要能跨流/脱敏）。
+                "gist": item.gist,
+                "source_type": source_stream_type,
             }
         )
         # 本地兜底也要登记进触发词索引（存算一体的「存」半），否则 booku 一挂，
@@ -290,6 +305,8 @@ async def _write_local(
                 "person": item.person_id,
                 "stream": stream_id,
                 "at": now,
+                "gist": item.gist,
+                "source_type": source_stream_type,
             }
         )
 
@@ -313,6 +330,7 @@ async def write_memories(
     *,
     stream_id: str = "",
     reason: str = "",
+    source_stream_type: str = "",
 ) -> SinkResult:
     """按配置把记忆写出去。
 
@@ -324,6 +342,8 @@ async def write_memories(
         config: 插件配置。
         stream_id: 来源聊天流（写日志与本地兜底用）。
         reason: 触发原因（写本地兜底记录用）。
+        source_stream_type: 来源流类型（private / group / discuss），
+            写进本地记忆索引，供召回侧的方向矩阵判定使用。
 
     Returns:
         写入结果。
@@ -337,16 +357,31 @@ async def write_memories(
         return SinkResult(ok=True, sink=sink_name, written=0)
 
     if sink_name == "local":
-        return await _write_local(normalized, stream_id, reason=reason)
+        return await _write_local(
+            normalized,
+            stream_id,
+            reason=reason,
+            source_stream_type=source_stream_type,
+        )
 
-    result = await _write_booku(normalized, config, stream_id=stream_id)
+    result = await _write_booku(
+        normalized,
+        config,
+        stream_id=stream_id,
+        source_stream_type=source_stream_type,
+    )
     if result.ok:
         return result
 
     logger.warning(
         f"[context_archiver] booku 写入失败，降级到本地 json（stream={stream_id[:8]}）: {result.error}"
     )
-    fallback = await _write_local(normalized, stream_id, reason=f"booku 降级: {result.error}")
+    fallback = await _write_local(
+        normalized,
+        stream_id,
+        reason=f"booku 降级: {result.error}",
+        source_stream_type=source_stream_type,
+    )
     fallback.fallback_used = True
     return fallback
 

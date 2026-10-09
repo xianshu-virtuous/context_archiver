@@ -26,32 +26,42 @@ from .. import state as state_module
 logger = get_logger("context_archiver.auto_recall")
 
 
-async def _person_id_of(stream_id: str) -> str:
-    """取该聊天流的对话者 id——**只在私聊有意义**。
+async def _stream_context_of(stream_id: str) -> dict[str, str]:
+    """取该聊天流的「对话者 id + 聊天类型」，一次查询喂给召回侧。
 
-    群聊没有单一对话者：实测群聊流的 ``person_id`` 就是 ``stream_id`` 的哈希，
-    拿它去查记忆必然 0 命中（还会白白多一次数据库查询）。
-    所以群聊直接返回空串，让人物路安静跳过，只走近因路。
+    人物 id **只在私聊有意义**：群聊没有单一对话者，实测群聊流的 ``person_id``
+    就是 ``stream_id`` 的哈希，拿它去查记忆必然 0 命中（还会白白多一次数据库查询）。
+    所以群聊返回空串，让人物路安静跳过，只走近因路。
+
+    ``chat_type`` 则是**隐私密度分层**的输入：召回侧要按「来源流类型 × 当前流类型」
+    判方向，这个判据必须来自流本身，不能靠猜。
+
+    Returns:
+        ``{"person_id": ..., "chat_type": ...}``；拿不到时两项都是空串。
     """
+    context = {"person_id": "", "chat_type": ""}
     if not stream_id:
-        return ""
+        return context
     try:
         info = await stream_api.get_stream_info(stream_id)
-    except Exception:  # noqa: BLE001 - 拿不到就不走人物路
-        return ""
+    except Exception:  # noqa: BLE001 - 拿不到就不走人物路、也不做方向判定
+        return context
     if not isinstance(info, dict):
-        return ""
+        return context
+
+    chat_type = str(info.get("chat_type") or "").strip().lower()
+    context["chat_type"] = chat_type
 
     group_id = info.get("group_id")
-    chat_type = str(info.get("chat_type") or "").lower()
     if group_id or chat_type == "group":
-        return ""
+        return context
 
     for key in ("person_id", "user_id", "target_id"):
         value = info.get(key)
         if value:
-            return str(value)
-    return ""
+            context["person_id"] = str(value)
+            break
+    return context
 
 
 class AutoRecallInjector(BaseEventHandler):
@@ -104,12 +114,14 @@ class AutoRecallInjector(BaseEventHandler):
         self._prune(cooldown)
 
         try:
-            person_id = await _person_id_of(stream_id)
+            stream_context = await _stream_context_of(stream_id)
             outcome = await recall_module.recall_for_prompt(
                 config,
                 values,
                 exclude_ids=set(self._recent.keys()),
-                person_id=person_id,
+                person_id=stream_context["person_id"],
+                stream_id=stream_id,
+                chat_type=stream_context["chat_type"],
             )
         except Exception as error:  # noqa: BLE001 - 召回失败绝不能影响 prompt 构建
             AutoRecallInjector._stats["last_error"] = f"{type(error).__name__}: {error}"

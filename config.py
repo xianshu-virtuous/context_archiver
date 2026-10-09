@@ -520,6 +520,80 @@ class ContextArchiverConfig(BaseConfig):
             description="是否连「消息太少不值得归档」的判定也打日志。",
         )
 
+    @config_section("privacy")
+    class PrivacySection(SectionBase):
+        """隐私密度分层：命中的流在归档时额外产出「外流版」，让跨流召回只剩印象。"""
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "隐私密度分层总开关（**默认开，升级即生效**）。\n"
+                "开启后，命中的流在归档时会额外产出一份「外流版」（gist）：\n"
+                "留住与对方关系的变化、情绪与大致主题，抹掉人名 / 事件 / 话术 / 细节。\n"
+                "同流召回仍用完整正文，跨流召回只注外流版。\n"
+                "关闭 = 完全回到 1.1.x 行为（记忆原样跨流）。"
+            ),
+        )
+        apply_to: list[str] = Field(
+            default_factory=lambda: ["private"],
+            description=(
+                "对哪些聊天类型做分层（private / group / discuss）。\n"
+                "群聊归档通常不敏感，默认只做私聊。"
+            ),
+        )
+        gist_max_ratio: float = Field(
+            default=0.4,
+            description="外流版长度上限：相对完整正文的比例（0.1 ~ 1.0）。",
+            ge=0.1,
+            le=1.0,
+        )
+        keep_relationship: bool = Field(
+            default=True,
+            description=(
+                "外流版是否保留「与对方关系的变化与温度」。\n"
+                "保留 = 人格连续（群里的她仍然像同一个人）；关闭 = 更安全，但更割裂。"
+            ),
+        )
+        gist_missing: str = Field(
+            default="drop",
+            description=(
+                "外流版缺失时怎么办：\n"
+                "drop —— 这条记忆不参与跨流注入（默认，宁可少一条）；\n"
+                "raw  —— 退回完整正文注入（不建议，等于没脱敏）。"
+            ),
+        )
+
+    @config_section("recall_scope")
+    class RecallScopeSection(SectionBase):
+        """跨流召回闸门：谁的内容可以出现在谁那儿（确定性方向矩阵）。"""
+
+        private_to_group: bool = Field(
+            default=False,
+            description=(
+                "私聊来源的记忆是否允许在群聊被召回。\n"
+                "**默认关** —— 这就是「私聊不外流」的那道闸。"
+            ),
+        )
+        group_to_private: bool = Field(
+            default=True,
+            description=(
+                "群聊来源的记忆是否允许在私聊被召回。\n"
+                "默认放行：让私聊里的她仍然知道外面发生过什么。"
+            ),
+        )
+        group_to_group: bool = Field(
+            default=False,
+            description="群聊来源的记忆是否允许在**别的**群聊被召回（默认禁，防串群）。",
+        )
+        unknown_source: str = Field(
+            default="allow",
+            description=(
+                "没有来源标记的历史记忆（1.2.0 之前写入的）怎么处理：\n"
+                "allow —— 照旧参与跨流召回（默认，旧记忆不失效）；\n"
+                "deny  —— 一律不参与跨流召回（最保守，但旧记忆会突然想不起来）。"
+            ),
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     trigger: TriggerSection = Field(default_factory=TriggerSection)
     archive: ArchiveSection = Field(default_factory=ArchiveSection)
@@ -528,6 +602,8 @@ class ContextArchiverConfig(BaseConfig):
     recall: RecallSection = Field(default_factory=RecallSection)
     audit: AuditSection = Field(default_factory=AuditSection)
     observer: ObserverSection = Field(default_factory=ObserverSection)
+    privacy: PrivacySection = Field(default_factory=PrivacySection)
+    recall_scope: RecallScopeSection = Field(default_factory=RecallScopeSection)
 
 
 __all__ = ["ContextArchiverConfig"]

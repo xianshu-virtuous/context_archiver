@@ -73,6 +73,7 @@ _SUMMARY_SYSTEM = """你是一个对话归档员。你的工作是把一段聊�
     {
       "title": "短标题",
       "content": "事实陈述",
+      "gist": "外流版（仅当本轮被要求提供时才有；否则省略此字段）",
       "memory_type": "event",
       "core_tags": ["标签1"],
       "diffusion_tags": ["标签2", "标签3"],
@@ -95,6 +96,58 @@ _SUMMARY_USER = """【归档时间】{now}
 {digest}
 
 请按系统提示的格式输出 JSON。"""
+
+
+#: 隐私密度分层：仅当来源流命中 ``[privacy].apply_to`` 时才追加到 user prompt。
+#:
+#: 目的：让**同一次**总结调用额外产出一份「外流版」——她换个场合也能想起这件事，
+#: 但只想起个印象，想不起内容。关系保留、内容抹除，是这里唯一的取舍原则。
+_PRIVACY_GIST_RULE = """
+【隐私分层要求】本流是{stream_kind}，本轮归档必须为**每条记忆**额外产出 `gist`（外流版）。
+
+`content` 照原要求写、细节照留——那一份是给本流自己用的完整版。
+`gist` 是这条记忆在**别的聊天场合**被想起时用的版本，必须做到：
+**读得出一段关系的走向，读不出任何具体内容。**
+
+gist 必须保留：
+- 与对方关系的变化与温度（更亲近了 / 有过一次不愉快 / 约定了一件事）
+- 情绪基调、大致的主题方向、时间
+
+gist 必须抹除：
+- 具体人名、昵称、身份、账号 —— 一律用「对方」「那个人」这类中性指代
+- 具体说过的话、具体经过、具体数字与地点
+- 身体、亲密、健康、财务等细节
+- 任何能让第三方反推出对象或事件的信息
+
+写法：不超过对应 content 的 {ratio}，通常一到两句；陈述语气，不写台词。
+宁可更抽象，也不要为了信息量留下可识别的细节。
+"""
+
+
+def should_tier(config: ContextArchiverConfig, chat_type: str) -> bool:
+    """本流是否要做隐私密度分层。
+
+    判定是纯配置的、确定性的——**不交给模型判断要不要脱敏**。
+
+    拿不到 ``chat_type``（空串）时返回 ``False``：此时记忆不会带 gist，
+    跨流召回会按 ``privacy.gist_missing`` 处理（默认 drop），
+    所以「判不出来」的结果是**不注入**，而不是裸奔。
+
+    Args:
+        config: 插件配置。
+        chat_type: 当前流的聊天类型（private / group / discuss）。
+
+    Returns:
+        是否需要产出外流版。
+    """
+    privacy = config.privacy
+    if not privacy.enabled:
+        return False
+    normalized = str(chat_type or "").strip().lower()
+    if not normalized:
+        return False
+    targets = {str(x).strip().lower() for x in (privacy.apply_to or [])}
+    return normalized in targets
 
 
 @dataclass
@@ -629,6 +682,7 @@ async def _summarize(
     start_ts: float,
     end_ts: float,
     count: int,
+    chat_type: str = "",
 ):
     """调一次模型，产出「摘要 + 记忆条目」。"""
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -642,6 +696,13 @@ async def _summarize(
         previous_summary=(previous_summary or "（还没有摘要，这是第一次归档）")[:2000],
         digest=digest,
     )
+    # 隐私密度分层：命中 apply_to 的流，在**同一次调用**里额外要一份外流版。
+    # 不加调用次数、只多几十个输出 token，所以分层几乎是白拿的。
+    if should_tier(config, chat_type):
+        user_prompt = user_prompt + _PRIVACY_GIST_RULE.format(
+            stream_kind=str(chat_type or "").strip().lower() or "私聊",
+            ratio=f"{float(config.privacy.gist_max_ratio):.0%}",
+        )
     return await llm_module.call(
         config,
         system_prompt=_SUMMARY_SYSTEM,
@@ -690,6 +751,9 @@ def _parse_summary_payload(
                         str(x) for x in (entry.get("triggers") or []) if str(x).strip()
                     ],
                     risk=str(entry.get("risk") or "normal"),
+                    # 隐私密度分层的「外流版」：跨流召回时用这一份代替 content。
+                    # 模型没给就是空串，读侧按 privacy.gist_missing 处理（默认 drop）。
+                    gist=str(entry.get("gist") or "").strip(),
                 )
             )
 
@@ -757,10 +821,14 @@ async def archive_stream(
     dominant_person = person_counter.most_common(1)[0][0] if person_counter else ""
 
     stream_name = ""
+    chat_type = ""
     try:
         info = await stream_api.get_stream_info(stream_id)
         if isinstance(info, dict):
             stream_name = str(info.get("stream_name") or info.get("name") or "")
+            # 隐私密度分层靠它决定「这个流要不要产出外流版」——
+            # 判定输入必须来自流本身，不能靠模型猜。
+            chat_type = str(info.get("chat_type") or "").strip().lower()
     except Exception:  # noqa: BLE001 - 拿不到名字不影响归档
         stream_name = ""
 
@@ -773,6 +841,7 @@ async def archive_stream(
         start_ts=start_ts,
         end_ts=end_ts,
         count=len(messages),
+        chat_type=chat_type,
     )
     if not result.ok:
         snapshot.error = f"总结调用失败: {result.error}"
@@ -802,6 +871,16 @@ async def archive_stream(
 
     summary, items, _ended = _parse_summary_payload(payload, fallback_summary="")
     summary = summary[: int(config.archive.summary_max_chars)]
+    # 外流版限长：模型偶尔会写长，超了就按 gist_max_ratio 截断。
+    # 截断比放任好——跨流注入的每一句都该是「印象」，不是「细节」。
+    if should_tier(config, chat_type):
+        _ratio = float(config.privacy.gist_max_ratio)
+        for item in items:
+            if not (item.gist and item.content):
+                continue
+            _limit = max(20, int(len(item.content) * _ratio))
+            if len(item.gist) > _limit:
+                item.gist = item.gist[:_limit].rstrip() + "…"
     if not summary:
         # 模型没给摘要就保留上一次的——别把之前写好的摘要冲成空串。
         summary = str(stream_state.summary or "")
@@ -831,6 +910,7 @@ async def archive_stream(
         config,
         stream_id=stream_id,
         reason=trigger,
+        source_stream_type=chat_type,
     )
     snapshot.sink = sink_result.sink
     snapshot.memory_ids = list(sink_result.memory_ids)
