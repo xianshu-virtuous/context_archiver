@@ -240,6 +240,50 @@ async def main() -> int:
         _use(_V2Sense(global_seconds=1.0))
         ok, reason = await archiver.global_quiet_ok(config)
         check("无 stream_id 且全局活跃 → 不放行", not ok and "全局仍有活动" in reason, reason)
+
+        # ── 5.5 加载期探测：注册表里还没注册时安静降级（字母序加载的坑） ──────
+        # 框架按插件名字母序加载，time_sense(t) 排在 context_archiver(c) 之后，
+        # 加载期直接 get_service() 必然扑空 → 框架刷 "Service 类未找到" WARNING，
+        # 还把「还没加载」误判成「没装」。这里守住修复后的行为。
+        section("5.5 time_sense 尚未注册：安静降级，不刷 WARNING、不误判")
+        original_all = archiver.service_api.get_all_services
+        calls: list[str] = []
+
+        def _record_get_service(signature: str):
+            calls.append(signature)
+            return _V2Sense()
+
+        try:
+            archiver.service_api.get_all_services = lambda: {  # type: ignore[assignment]
+                "other_plugin:service:other": object
+            }
+            archiver.service_api.get_service = _record_get_service  # type: ignore[assignment]
+            check("5.5a 未注册时预检明确返回 False", archiver.time_sense_registered() is False)
+            ok, reason = await archiver.global_quiet_ok(config, stream_id="s1")
+            check("5.5b 未注册时安静放行（绝不挡住归档）", ok and "尚未注册" in reason, reason)
+            check("5.5c 未注册时一次 get_service 都没发", not calls, str(calls))
+
+            archiver.service_api.get_all_services = lambda: {}  # type: ignore[assignment]
+            check(
+                "5.5c2 注册表为空时不武断（None，退回取服务）",
+                archiver.time_sense_registered() is None,
+            )
+
+            archiver.service_api.get_all_services = lambda: {  # type: ignore[assignment]
+                archiver.TIME_SENSE_SIGNATURE: object
+            }
+            check("5.5d 已注册时预检返回 True", archiver.time_sense_registered() is True)
+            _use(_V2Sense(own_seconds=600.0))
+            ok, reason = await archiver.global_quiet_ok(config, stream_id="s1")
+            check("5.5e 已注册时按流判定照旧", ok and "按流校验通过" in reason, reason)
+
+            def _boom_all():
+                raise RuntimeError("registry down")
+
+            archiver.service_api.get_all_services = _boom_all  # type: ignore[assignment]
+            check("5.5f 注册表不可读时答案是「未知」", archiver.time_sense_registered() is None)
+        finally:
+            archiver.service_api.get_all_services = original_all  # type: ignore[assignment]
     finally:
         archiver.service_api.get_service = original  # type: ignore[assignment]
 

@@ -62,6 +62,7 @@
   "api_version": {
     "command_api": "1.0.0",
     "config_api": "1.0.0",
+    "event_api": "1.0.0",
     "llm_api": "1.0.0",
     "log_api": "1.0.0",
     "permission_api": "1.0.0",

@@ -34,6 +34,35 @@ logger = get_logger("context_archiver.archiver")
 #: time_sense 的服务组件签名（**软依赖**：取不到就降级，不进 manifest 依赖）。
 TIME_SENSE_SIGNATURE = "time_sense:service:time_sense"
 
+#: 归档成功后广播的自定义事件名（别的插件可订阅，用于「归档即联动」）。
+EVENT_ARCHIVED = "context_archiver:archived"
+
+
+def time_sense_registered() -> bool | None:
+    """time_sense 的服务组件此刻是否已注册进全局组件注册表。
+
+    框架按插件名做拓扑排序、同层按**字母序**加载：``time_sense``(t) 排在
+    ``context_archiver``(c) 之后，所以加载期任何 ``get_service()`` 都必然扑空
+    ——框架会为此打一条 ``Service 类未找到`` 的 WARNING，而「装了 time_sense
+    却被判成没装」也是这么来的（同一个坑 ``daily_schedule`` 已经踩过并修好）。
+
+    这里用**只读**的 ``get_all_services()`` 预检：明确没注册就安静短路，
+    一条 WARNING 都不惊动。要等它出现，请在启动流程里轮询本函数
+    （``daily_schedule`` 的 ``_wait_time_sense`` 就是这个手法）。
+
+    Returns:
+        True：已注册；False：注册表可读且明确没有；
+        None：判断不了（注册表不可读，或表还是空的——此时不武断，退回直接取服务）。
+    """
+    try:
+        registered = service_api.get_all_services()
+    except Exception as error:  # noqa: BLE001 - 注册表不可读时按未知处理
+        logger.debug(f"[context_archiver] 读取组件注册表失败: {error}")
+        return None
+    if not isinstance(registered, dict) or not registered:
+        return None
+    return TIME_SENSE_SIGNATURE in registered
+
 #: 触发原因文案。
 TRIGGER_END_SIGNAL = "end_signal"
 TRIGGER_IDLE = "idle"
@@ -604,6 +633,11 @@ async def global_quiet_ok(
     if not (trigger_cfg.use_time_sense and trigger_cfg.require_global_quiet):
         return True, "未启用全局静默校验"
 
+    # 先只读预检短路：框架按字母序加载，加载期探测「后加载的」插件必然扑空，
+    # 直接调 get_service() 会白刷一条 WARNING，还会把「还没加载」当成「没装」。
+    if time_sense_registered() is False:
+        return True, "time_sense 尚未注册（安静降级）"
+
     try:
         service = service_api.get_service(TIME_SENSE_SIGNATURE)
     except Exception as error:  # noqa: BLE001 - 服务不可用按降级处理
@@ -974,6 +1008,12 @@ async def archive_stream(
 
     await _write_audit(config, snapshot, summary=summary)
 
+    # ── 对外广播（只在成功路径） ─────────────────────────────────────────────
+    # 「归档即联动」的落点：日记类插件订阅 `context_archiver:archived` 就能立刻
+    # 收下本次摘要与 memory_id，不必等下一次巡检。失败路径由函数内部挡掉
+    # （水位线没推进、下次会重新总结，发了反而会收进半截素材）。
+    await _publish_archived_event(config, snapshot, summary=summary)
+
     logger.info(
         f"[context_archiver] 归档完成：stream={stream_id[:8]} trigger={trigger} "
         f"messages={snapshot.message_count} memories={sink_result.written} "
@@ -1004,6 +1044,66 @@ async def _write_audit(
         error=snapshot.error,
     )
     await state_module.append_audit(record, keep=int(config.audit.keep_records))
+
+
+async def _publish_archived_event(
+    config: ContextArchiverConfig,
+    snapshot: StreamSnapshot,
+    *,
+    summary: str,
+) -> None:
+    """广播 ``context_archiver:archived``（归档成功后的实时联动口）。
+
+    payload 里的字段名是**对外契约**，只做加法、不改名（订阅方按名取值）：
+
+    - ``stream_id`` / ``at`` / ``start_ts`` / ``end_ts`` / ``message_count``
+    - ``summary``（本次滚动摘要）/ ``memory_ids``（本次写入的记忆 id 列表）
+    - ``sink`` / ``cleared`` / ``truncated`` / ``trigger`` / ``error``
+
+    Args:
+        config: 插件配置。
+        snapshot: 本次归档快照。
+        summary: 本次滚动摘要。
+
+    Returns:
+        None。发布失败只记日志，**绝不影响归档本身**。
+    """
+    # 失败路径不广播：水位线没推进、下次会重新总结，推出去只会让订阅方
+    # 收进半截素材。守卫放在函数里而不是调用点，免得将来多一个调用点忘了判。
+    if not snapshot.ok:
+        return
+
+    if not bool(getattr(getattr(config, "events", None), "published", True)):
+        return
+
+    try:
+        from src.app.plugin_system.api import event_api
+    except Exception as error:  # noqa: BLE001 - API 不可用时安静跳过
+        logger.debug(f"[context_archiver] event_api 不可用，跳过归档广播: {error}")
+        return
+
+    payload = {
+        "event": EVENT_ARCHIVED,
+        "source": "context_archiver",
+        "timestamp": time.time(),
+        "stream_id": snapshot.stream_id,
+        "at": time.time(),
+        "start_ts": float(snapshot.start_ts),
+        "end_ts": float(snapshot.end_ts),
+        "message_count": int(snapshot.message_count),
+        "summary": summary,
+        "memory_ids": list(snapshot.memory_ids),
+        "sink": snapshot.sink,
+        "cleared": bool(snapshot.cleared),
+        "truncated": bool(snapshot.truncated),
+        "trigger": snapshot.trigger,
+        "error": snapshot.error,
+    }
+
+    try:
+        await event_api.publish_event(EVENT_ARCHIVED, payload)
+    except Exception as error:  # noqa: BLE001 - 广播失败不该影响归档
+        logger.warning(f"[context_archiver] 发布归档事件失败: {error}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1120,6 +1220,7 @@ async def tick(config: ContextArchiverConfig, *, now: float | None = None) -> li
 
 __all__ = [
     "TIME_SENSE_SIGNATURE",
+    "EVENT_ARCHIVED",
     "TRIGGER_END_SIGNAL",
     "TRIGGER_IDLE",
     "TRIGGER_MANUAL",
@@ -1132,4 +1233,5 @@ __all__ = [
     "evaluate",
     "global_quiet_ok",
     "tick",
+    "time_sense_registered",
 ]

@@ -594,6 +594,21 @@ class ContextArchiverConfig(BaseConfig):
             ),
         )
 
+    @config_section("events")
+    class EventsSection(SectionBase):
+        """对外事件广播（给别的插件实时联动用）。"""
+
+        published: bool = Field(
+            default=True,
+            description=(
+                "归档成功后是否广播 ``context_archiver:archived`` 事件。\n"
+                "它是「归档即联动」的落点：日记类插件订阅它就**立刻**拿到本次摘要与\n"
+                "memory_id，不必等下一次巡检（巡检兜底仍然有效）。\n"
+                "**无订阅者时事件总线本身零开销**，所以默认开着不会白白花钱；\n"
+                "不想要就把这里设 false。"
+            ),
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     trigger: TriggerSection = Field(default_factory=TriggerSection)
     archive: ArchiveSection = Field(default_factory=ArchiveSection)
@@ -604,6 +619,7 @@ class ContextArchiverConfig(BaseConfig):
     observer: ObserverSection = Field(default_factory=ObserverSection)
     privacy: PrivacySection = Field(default_factory=PrivacySection)
     recall_scope: RecallScopeSection = Field(default_factory=RecallScopeSection)
+    events: EventsSection = Field(default_factory=EventsSection)
 
 
 __all__ = ["ContextArchiverConfig"]
